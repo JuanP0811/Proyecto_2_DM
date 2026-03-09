@@ -1,0 +1,22 @@
+# Base de datos PostgreSQL (datos locales, no subir)
+postgres/
+
+# Variables de entorno con credenciales
+.env
+
+# Datos del scheduler
+scheduler_data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
