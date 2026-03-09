@@ -1,0 +1,277 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+import os
+import psycopg2
+from datetime import date
+
+
+def month_start(d):
+    return date(d.year, d.month, 1)
+
+
+def next_month(d):
+    if d.month == 12:
+        return date(d.year + 1, 1, 1)
+    return date(d.year, d.month + 1, 1)
+
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Reemplaza gold.fct_trips por una versión particionada por RANGE(pickup_date_key)
+    y carga los datos mes por mes para evitar problemas de I/O / espacio.
+    """
+
+    conn = None
+    cur = None
+
+    try:
+        print("🔹 Conectando a Postgres...")
+
+        conn.autocommit = False
+        cur = conn.cursor()
+
+        print("🔹 Verificando existencia de gold.fct_trips...")
+        cur.execute("""
+            select exists (
+                select 1
+                from information_schema.tables
+                where table_schema = 'gold'
+                  and table_name = 'fct_trips'
+            );
+        """)
+        exists = cur.fetchone()[0]
+
+        if not exists:
+            raise Exception("La tabla gold.fct_trips no existe.")
+
+        print("🔹 Detectando rango de fechas...")
+        cur.execute("""
+            select
+                min(pickup_date_key)::date as min_date,
+                max(pickup_date_key)::date as max_date,
+                count(*) as total_rows
+            from gold.fct_trips
+            where pickup_date_key is not null;
+        """)
+        min_date, max_date, source_count = cur.fetchone()
+
+        if min_date is None or max_date is None:
+            raise Exception("No se encontraron fechas válidas en gold.fct_trips.")
+
+        start_month = month_start(min_date)
+        end_month_exclusive = next_month(month_start(max_date))
+
+        print(f"✅ Rango detectado: {min_date} -> {max_date}")
+        print(f"✅ Total filas fuente: {source_count}")
+
+        print("🔹 Eliminando respaldo previo si existe...")
+        cur.execute("drop table if exists gold.fct_trips_backup cascade;")
+
+        print("🔹 Renombrando tabla actual a backup...")
+        cur.execute("""
+            alter table gold.fct_trips
+            rename to fct_trips_backup;
+        """)
+
+        print("🔹 Creando tabla padre particionada gold.fct_trips...")
+        cur.execute("""
+            create table gold.fct_trips (
+                trip_key text not null,
+                pickup_date_key date not null,
+                dropoff_date_key date,
+                pu_zone_key integer,
+                do_zone_key integer,
+                service_type_key text,
+                payment_type_key integer,
+                vendor_key integer,
+                pickup_ts timestamp,
+                dropoff_ts timestamp,
+                passenger_count numeric,
+                trip_distance numeric,
+                trip_duration_min numeric,
+                fare_amount numeric,
+                extra numeric,
+                mta_tax numeric,
+                tip_amount numeric,
+                tolls_amount numeric,
+                improvement_surcharge numeric,
+                congestion_surcharge numeric,
+                airport_fee numeric,
+                ehail_fee numeric,
+                total_amount numeric,
+                tip_pct numeric,
+                avg_speed_mph numeric,
+                ratecodeid numeric,
+                store_and_fwd_flag text,
+                trip_type numeric,
+                source_month text
+            ) partition by range (pickup_date_key);
+        """)
+
+        print("🔹 Creando particiones mensuales...")
+        partitions_created = []
+        current = start_month
+
+        while current < end_month_exclusive:
+            nxt = next_month(current)
+            partition_name = f"fct_trips_{current.strftime('%Y_%m')}"
+            sql = f"""
+                create table gold.{partition_name}
+                partition of gold.fct_trips
+                for values from ('{current}') to ('{nxt}');
+            """
+            cur.execute(sql)
+            partitions_created.append(partition_name)
+            print(f"   ✅ {partition_name}: [{current} -> {nxt})")
+            current = nxt
+
+        print(f"✅ {len(partitions_created)} particiones creadas.")
+
+        print("🔹 Copiando datos mes por mes...")
+        inserted_total = 0
+        current = start_month
+
+        while current < end_month_exclusive:
+            nxt = next_month(current)
+
+            print(f"   🔹 Insertando mes {current.strftime('%Y-%m')} ...")
+            cur.execute("""
+                insert into gold.fct_trips (
+                    trip_key,
+                    pickup_date_key,
+                    dropoff_date_key,
+                    pu_zone_key,
+                    do_zone_key,
+                    service_type_key,
+                    payment_type_key,
+                    vendor_key,
+                    pickup_ts,
+                    dropoff_ts,
+                    passenger_count,
+                    trip_distance,
+                    trip_duration_min,
+                    fare_amount,
+                    extra,
+                    mta_tax,
+                    tip_amount,
+                    tolls_amount,
+                    improvement_surcharge,
+                    congestion_surcharge,
+                    airport_fee,
+                    ehail_fee,
+                    total_amount,
+                    tip_pct,
+                    avg_speed_mph,
+                    ratecodeid,
+                    store_and_fwd_flag,
+                    trip_type,
+                    source_month
+                )
+                select
+                    trip_key,
+                    pickup_date_key,
+                    dropoff_date_key,
+                    pu_zone_key,
+                    do_zone_key,
+                    service_type_key,
+                    payment_type_key,
+                    vendor_key,
+                    pickup_ts,
+                    dropoff_ts,
+                    passenger_count,
+                    trip_distance,
+                    trip_duration_min,
+                    fare_amount,
+                    extra,
+                    mta_tax,
+                    tip_amount,
+                    tolls_amount,
+                    improvement_surcharge,
+                    congestion_surcharge,
+                    airport_fee,
+                    ehail_fee,
+                    total_amount,
+                    tip_pct,
+                    avg_speed_mph,
+                    ratecodeid,
+                    store_and_fwd_flag,
+                    trip_type,
+                    source_month
+                from gold.fct_trips_backup
+                where pickup_date_key >= %s
+                  and pickup_date_key < %s;
+            """, (current, nxt))
+
+            month_rows = cur.rowcount if cur.rowcount != -1 else None
+            print(f"      ✅ Filas insertadas: {month_rows}")
+            if month_rows and month_rows > 0:
+                inserted_total += month_rows
+
+            # commit por mes para no acumular tanto WAL / memoria / riesgo
+            conn.commit()
+
+            current = nxt
+
+        print("🔹 Validando conteos finales...")
+        cur.execute("select count(*) from gold.fct_trips_backup;")
+        backup_count = cur.fetchone()[0]
+
+        cur.execute("select count(*) from gold.fct_trips;")
+        final_count = cur.fetchone()[0]
+
+        print(f"✅ Conteo backup: {backup_count}")
+        print(f"✅ Conteo particionada: {final_count}")
+
+        if backup_count != final_count:
+            raise Exception(
+                f"Conteo inconsistente: backup={backup_count}, particionada={final_count}"
+            )
+
+        print("🔹 Creando índice útil sobre pickup_date_key en tabla padre...")
+        # En PostgreSQL moderno esto crea índices en particiones también
+        cur.execute("""
+            create index if not exists idx_fct_trips_pickup_date_key
+            on gold.fct_trips (pickup_date_key);
+        """)
+
+        print("🔹 Commit final...")
+        conn.commit()
+
+        result = {
+            "status": "success",
+            "source_count": source_count,
+            "backup_count": backup_count,
+            "final_count": final_count,
+            "partitions_created": partitions_created,
+            "partition_count": len(partitions_created),
+            "date_range": {
+                "min_date": str(min_date),
+                "max_date": str(max_date),
+            },
+        }
+
+        print("✅ Particionamiento completado correctamente.")
+        return result
+
+    except Exception as e:
+        if conn:
+            print("❌ Error detectado, haciendo rollback...")
+            conn.rollback()
+        raise e
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "La salida es undefined"
+    assert output["status"] == "success", "El particionamiento no terminó correctamente"
+    assert output["backup_count"] == output["final_count"], "Los conteos no coinciden"

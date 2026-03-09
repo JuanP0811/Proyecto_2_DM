@@ -1,0 +1,149 @@
+if 'data_loader' not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+import os
+import json
+import pandas as pd
+from datetime import datetime, timezone
+
+import psycopg2
+
+
+def _normalize_month(m: int) -> str:
+    if m < 1 or m > 12:
+        raise ValueError(f"Invalid month: {m}")
+    return f"{m:02d}"
+
+
+def _month_range(start_ym: str, end_ym: str) -> list[str]:
+    """Inclusive range of YYYY-MM strings."""
+    sy, sm = map(int, start_ym.split("-"))
+    ey, em = map(int, end_ym.split("-"))
+    out = []
+    y, m = sy, sm
+    while (y < ey) or (y == ey and m <= em):
+        out.append(f"{y}-{_normalize_month(m)}")
+        m += 1
+        if m == 13:
+            m = 1
+            y += 1
+    return out
+
+
+def _build_tlc_parquet_url(service_type: str, year_month: str) -> str:
+    # https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet
+    st = service_type.lower().strip()
+    if st not in {"yellow", "green"}:
+        raise ValueError("service_type must be 'yellow' or 'green'")
+    return f"https://d37ci6vzurychx.cloudfront.net/trip-data/{st}_tripdata_{year_month}.parquet"
+
+
+def _pg_conn_from_env():
+    host = os.getenv("POSTGRES_HOST", "warehouse")
+    port = int(os.getenv("POSTGRES_PORT", "5432"))
+    db = os.getenv("POSTGRES_DB", "qbo")
+    user = os.getenv("POSTGRES_USER", "root")
+    pwd = os.getenv("POSTGRES_PASSWORD", "root")
+
+
+
+def _ensure_audit_table(cur):
+    cur.execute("""
+        CREATE SCHEMA IF NOT EXISTS bronze;
+        CREATE TABLE IF NOT EXISTS bronze.ingest_audit (
+            year_month      TEXT NOT NULL,
+            service_type    TEXT NOT NULL,
+            status          TEXT NOT NULL,      -- loaded | missing | failed
+            row_count       BIGINT,
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            error_message   TEXT,
+            PRIMARY KEY (year_month, service_type)
+        );
+    """)
+
+
+def _next_pending_year_month(cur, start_ym="2022-01", end_ym="2025-12") -> str | None:
+    months = _month_range(start_ym, end_ym)
+
+    cur.execute("""
+        SELECT year_month, service_type, status
+        FROM bronze.ingest_audit
+        WHERE year_month >= %s AND year_month <= %s
+    """, (start_ym, end_ym))
+    rows = cur.fetchall()
+
+    status_map = {}  # (ym, st) -> status
+    for ym, st, status in rows:
+        status_map[(ym, st)] = status
+
+    # pick earliest month where either yellow or green not loaded
+    for ym in months:
+        y_status = status_map.get((ym, "yellow"))
+        g_status = status_map.get((ym, "green"))
+        if y_status != "loaded" or g_status != "loaded":
+            return ym
+
+    return None
+
+
+@data_loader
+def load_data(*args, **kwargs):
+    """
+    Automatic loader (NO runtime vars):
+      - looks at bronze.ingest_audit
+      - picks next pending month between 2022-01 and 2025-12
+      - loads BOTH yellow + green for that month
+      - returns a list of chunks:
+          [{"df": DataFrame or None, "year_month": "YYYY-MM", "service_type": "...", "status": "...", "error": "..."}]
+    """
+    chunks = []
+    conn = _pg_conn_from_env()
+    try:
+        cur = conn.cursor()
+    try:
+        _ensure_audit_table(cur)
+        conn.commit()
+
+        ym = _next_pending_year_month(cur, "2022-01", "2025-12")
+        finally:
+        cur.close()
+finally:
+    conn.close()
+
+
+    if ym is None:
+        # Everything loaded
+        return []
+
+    ingest_ts = datetime.now(timezone.utc)
+
+    for service_type in ["yellow", "green"]:
+        url = _build_tlc_parquet_url(service_type, ym)
+        try:
+            df = pd.read_parquet(url, engine="pyarrow")
+            df["ingest_ts"] = ingest_ts
+            df["source_month"] = ym
+            df["service_type"] = service_type
+            chunks.append({"df": df, "year_month": ym, "service_type": service_type, "status": "loaded", "error": None})
+        except Exception as e:
+            # File missing or download/read error; exporter will record it in audit
+            chunks.append({"df": None, "year_month": ym, "service_type": service_type, "status": "missing", "error": str(e)})
+
+    return chunks
+
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "Output is undefined"
+    assert isinstance(output, list), "Expected a list of chunk dicts"
+    # It can be [] when everything is already loaded
+    if len(output) == 0:
+        return
+
+    for item in output:
+        assert "year_month" in item
+        assert "service_type" in item
+        assert "status" in item
+        # df can be None for missing/failed cases

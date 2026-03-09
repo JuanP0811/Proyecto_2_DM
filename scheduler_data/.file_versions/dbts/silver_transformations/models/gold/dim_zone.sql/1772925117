@@ -1,0 +1,29 @@
+with all_zones as (
+
+    select
+        pulocationid as zone_key,
+        pu_borough as borough,
+        pu_zone as zone,
+        pu_service_zone as service_zone
+    from silver.trips_silver_clean
+    where pulocationid is not null
+
+    union
+
+    select
+        dolocationid as zone_key,
+        do_borough as borough,
+        do_zone as zone,
+        do_service_zone as service_zone
+    from silver.trips_silver_clean
+    where dolocationid is not null
+
+)
+
+select
+    zone_key,
+    borough,
+    zone,
+    service_zone
+from all_zones
+where zone_key is not null

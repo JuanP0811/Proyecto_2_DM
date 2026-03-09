@@ -1,0 +1,81 @@
+import pandas as pd
+import time
+
+if 'data_loader' not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+
+@data_loader
+def load_data(*args, **kwargs):
+    years = [2022, 2023, 2024, 2025]
+    total_jobs = len(years) * 12
+
+    print("=" * 70)
+    print("[START] Data Loader: ingest Yellow Taxi 2022-2025 (monthly parquet)")
+    print(f"[INFO] Total meses a intentar: {total_jobs}")
+    print("=" * 70)
+
+    resultados = []
+    ok_count = 0
+    err_count = 0
+    t0 = time.time()
+
+    for y_i, year in enumerate(years, start=1):
+        print(f"\n[CHECKPOINT] Iniciando año {year} ({y_i}/{len(years)})")
+
+        for month in range(1, 13):
+            mm = f"{month:02d}"
+            job_idx = (y_i - 1) * 12 + month  # 1..48
+            year_month = f"{year}-{mm}"
+
+            url_parquet = (
+                f"https://d37ci6vzurychx.cloudfront.net/trip-data/"
+                f"yellow_tripdata_{year}-{mm}.parquet"
+            )
+
+            print(f"\n[JOB {job_idx}/{total_jobs}] Descargando {year_month}")
+            print(f"[JOB {job_idx}] URL: {url_parquet}")
+
+            t_job = time.time()
+            try:
+                df = pd.read_parquet(url_parquet, engine="pyarrow")
+                elapsed = time.time() - t_job
+
+                print(f"[JOB {job_idx}] OK -> shape={df.shape} | time={elapsed:.2f}s")
+
+                # metadata útil para downstream (exporter / auditoría)
+                df["source_month"] = year_month
+                df["service_type"] = "yellow"
+
+                resultados.append(df)
+                ok_count += 1
+
+                # progreso acumulado
+                print(f"[PROGRESS] OK={ok_count} | ERR={err_count} | Cargados={len(resultados)}")
+
+            except Exception as e:
+                elapsed = time.time() - t_job
+                err_count += 1
+                print(f"[JOB {job_idx}] ERROR -> time={elapsed:.2f}s | {type(e).__name__}: {e}")
+                print(f"[PROGRESS] OK={ok_count} | ERR={err_count} | Cargados={len(resultados)}")
+                continue
+
+    total_elapsed = time.time() - t0
+    print("\n" + "=" * 70)
+    print("[END] Data Loader terminado")
+    print(f"[SUMMARY] OK months: {ok_count} | ERROR months: {err_count} | Total DF: {len(resultados)}")
+    print(f"[SUMMARY] Total time: {total_elapsed/60:.2f} min")
+    print("=" * 70)
+
+    return resultados
+
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "El output es undefined"
+    assert isinstance(output, list), "Se esperaba una lista de DataFrames"
+    assert len(output) > 0, "No se cargó ningún mes"
+    assert all(("source_month" in df.columns and "service_type" in df.columns) for df in output), \
+        "Faltan columnas metadata en uno o más DataFrames"

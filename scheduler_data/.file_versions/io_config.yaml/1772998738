@@ -1,0 +1,12 @@
+version: 0.1.1
+
+default: dev
+
+dev:
+  postgres:
+    username: root
+    password: root
+    host: warehouse
+    port: 5432
+    database: qbo
+    schema: gold

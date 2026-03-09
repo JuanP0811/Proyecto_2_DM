@@ -1,0 +1,12 @@
+dbt_project:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "warehouse"          # o localhost, según tu docker-compose
+      port: 5432
+      user: "root"
+      password: "root"
+      dbname: "qbo"
+      schema: "silver"
+      threads: 4

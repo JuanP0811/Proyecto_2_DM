@@ -1,0 +1,305 @@
+import os
+import time
+import gc
+import math
+from datetime import datetime
+from urllib.request import urlretrieve
+
+import pandas as pd
+import pyarrow.dataset as ds
+from sqlalchemy import create_engine, text
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+
+if 'data_exporter' not in globals():
+    from mage_ai.data_preparation.decorators import data_exporter
+
+
+# -----------------------------
+# Conexión a Postgres (Mage Secrets)
+# -----------------------------
+def pg_engine():
+    host = get_secret_value("POSTGRES_HOST")
+    port = get_secret_value("POSTGRES_PORT") or "5432"
+    db   = get_secret_value("POSTGRES_DB")
+    user = get_secret_value("POSTGRES_USER")
+    pwd  = get_secret_value("POSTGRES_PASSWORD")
+    return create_engine(f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}")
+
+
+# -----------------------------
+# DDL: schema + tablas + índice
+# -----------------------------
+def ensure_bronze_tables(conn):
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS bronze;"))
+
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS bronze.trips_raw (
+          ingest_ts     TIMESTAMP NOT NULL,
+          source_month  TEXT      NOT NULL,
+          service_type  TEXT      NOT NULL,
+
+          vendorid              INTEGER NULL,
+          tpep_pickup_datetime  TIMESTAMP NULL,
+          tpep_dropoff_datetime TIMESTAMP NULL,
+          lpep_pickup_datetime  TIMESTAMP NULL,
+          lpep_dropoff_datetime TIMESTAMP NULL,
+
+          passenger_count       NUMERIC NULL,
+          trip_distance         NUMERIC NULL,
+
+          pulocationid          INTEGER NULL,
+          dolocationid          INTEGER NULL,
+
+          ratecodeid            NUMERIC NULL,
+          store_and_fwd_flag    TEXT NULL,
+
+          payment_type          INTEGER NULL,
+
+          fare_amount           NUMERIC NULL,
+          extra                 NUMERIC NULL,
+          mta_tax               NUMERIC NULL,
+          tip_amount            NUMERIC NULL,
+          tolls_amount          NUMERIC NULL,
+          improvement_surcharge NUMERIC NULL,
+          total_amount          NUMERIC NULL,
+          congestion_surcharge  NUMERIC NULL,
+          airport_fee           NUMERIC NULL,
+
+          ehail_fee             NUMERIC NULL,
+          trip_type             NUMERIC NULL
+        );
+    """))
+
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS idx_trips_raw_month_service
+        ON bronze.trips_raw (source_month, service_type);
+    """))
+
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS bronze.ingest_coverage (
+          year_month   TEXT NOT NULL,
+          service_type TEXT NOT NULL,
+          status       TEXT NOT NULL,
+          row_count    BIGINT NULL,
+          updated_ts   TIMESTAMP NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (year_month, service_type)
+        );
+    """))
+
+
+# -----------------------------
+# Alinear DF al schema objetivo
+# -----------------------------
+TARGET_COLS = [
+    "ingest_ts", "source_month", "service_type",
+    "vendorid",
+    "tpep_pickup_datetime", "tpep_dropoff_datetime",
+    "lpep_pickup_datetime", "lpep_dropoff_datetime",
+    "passenger_count", "trip_distance",
+    "pulocationid", "dolocationid",
+    "ratecodeid", "store_and_fwd_flag",
+    "payment_type",
+    "fare_amount", "extra", "mta_tax", "tip_amount", "tolls_amount",
+    "improvement_surcharge", "total_amount", "congestion_surcharge", "airport_fee",
+    "ehail_fee", "trip_type",
+]
+
+def align_to_target_schema(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.lower() for c in df.columns]
+
+    rename_map = {
+        "pu_locationid": "pulocationid",
+        "do_locationid": "dolocationid",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    for c in TARGET_COLS:
+        if c not in df.columns:
+            df[c] = None
+
+    return df[TARGET_COLS]
+
+
+def upsert_coverage(conn, ym, st, status, row_count=None):
+    conn.execute(text("""
+        INSERT INTO bronze.ingest_coverage(year_month, service_type, status, row_count, updated_ts)
+        VALUES (:ym, :st, :status, :rc, NOW())
+        ON CONFLICT (year_month, service_type)
+        DO UPDATE SET status=:status, row_count=:rc, updated_ts=NOW()
+    """), {"ym": ym, "st": st, "status": status, "rc": row_count})
+
+
+# -----------------------------
+# Exporter: descarga local + streaming
+# -----------------------------
+@data_exporter
+def export_data(data, *args, **kwargs):
+    # unwrap por si Mage envuelve
+    jobs = data
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, list):
+                jobs = v
+                break
+
+    if not isinstance(jobs, list) or not jobs:
+        raise ValueError(f"Se esperaba lista de jobs. Llegó: {type(data)}")
+
+    engine = pg_engine()
+
+    # Parámetros
+    batch_size = int(kwargs.get("batch_size", 25_000))     # lectura parquet local -> batches
+    chunksize  = int(kwargs.get("chunksize", 10_000))      # escritura SQL -> chunks
+    log_every_batches = int(kwargs.get("log_every_batches", 5))
+    tmp_dir = kwargs.get("tmp_dir", "/tmp/tlc_parquet")
+
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    total = len(jobs)
+    ok = 0
+    missing = 0
+    failed = 0
+
+    print("=" * 110, flush=True)
+    print("[START] Exporter STREAMING (descarga local) -> bronze.trips_raw", flush=True)
+    print(f"[CONFIG] jobs={total} | batch_size(read)={batch_size} | chunksize(sql)={chunksize} | tmp_dir={tmp_dir}", flush=True)
+    print("=" * 110, flush=True)
+
+    # Asegura tablas
+    with engine.begin() as conn:
+        ensure_bronze_tables(conn)
+    print("[INIT] Tablas bronze aseguradas (trips_raw, ingest_coverage)", flush=True)
+
+    t_all = time.time()
+
+    for i, job in enumerate(jobs, start=1):
+        ym = job["year_month"]
+        st = job["service_type"]
+        url = job["url_parquet"]
+
+        local_path = os.path.join(tmp_dir, f"{st}_{ym}.parquet")
+
+        print("\n" + "-" * 110, flush=True)
+        print(f"[JOB {i}/{total}] START | {st} {ym}", flush=True)
+        print(f"[JOB {i}] URL={url}", flush=True)
+
+        # 1) Descargar parquet
+        try:
+            t_dl = time.time()
+            # reusar si ya existe
+            if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+                print(f"[JOB {i}] Downloading -> {local_path}", flush=True)
+                urlretrieve(url, local_path)
+            size_mb = os.path.getsize(local_path) / (1024 * 1024)
+            print(f"[JOB {i}] Download OK | size={size_mb:.1f} MB | time={time.time()-t_dl:.2f}s", flush=True)
+        except Exception as e:
+            missing += 1
+            print(f"[JOB {i}] ERROR download | {type(e).__name__}: {e}", flush=True)
+            with engine.begin() as conn:
+                upsert_coverage(conn, ym, st, "missing", None)
+            # limpiar por si quedó corrupto
+            try:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            except Exception:
+                pass
+            continue
+
+        # 2) Crear dataset desde archivo local (streaming)
+        try:
+            t_ds = time.time()
+            dataset = ds.dataset(local_path, format="parquet")
+            print(f"[JOB {i}] dataset(local) OK | time={time.time()-t_ds:.2f}s", flush=True)
+        except Exception as e:
+            failed += 1
+            print(f"[JOB {i}] ERROR dataset(local) | {type(e).__name__}: {e}", flush=True)
+            with engine.begin() as conn:
+                upsert_coverage(conn, ym, st, "failed", None)
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+            continue
+
+        total_rows = 0
+        batch_idx = 0
+        t_job = time.time()
+
+        try:
+            with engine.begin() as conn:
+                # 3) Idempotencia
+                t_del = time.time()
+                conn.execute(
+                    text("DELETE FROM bronze.trips_raw WHERE source_month=:ym AND service_type=:st"),
+                    {"ym": ym, "st": st}
+                )
+                print(f"[JOB {i}] DELETE OK | time={time.time()-t_del:.2f}s", flush=True)
+
+                # 4) Streaming batches
+                t_stream = time.time()
+                for record_batch in dataset.to_batches(batch_size=batch_size):
+                    batch_idx += 1
+                    df_chunk = record_batch.to_pandas()
+
+                    df_chunk["ingest_ts"] = datetime.utcnow()
+                    df_chunk["source_month"] = ym
+                    df_chunk["service_type"] = st
+
+                    df_chunk = align_to_target_schema(df_chunk)
+
+                    df_chunk.to_sql(
+                        name="trips_raw",
+                        con=conn,
+                        schema="bronze",
+                        if_exists="append",
+                        index=False,
+                        method="multi",
+                        chunksize=chunksize
+                    )
+
+                    total_rows += len(df_chunk)
+
+                    del df_chunk
+                    gc.collect()
+
+                    if log_every_batches > 0 and batch_idx % log_every_batches == 0:
+                        print(f"[JOB {i}] PROGRESS | batches={batch_idx} | rows_loaded={total_rows} | elapsed={time.time()-t_stream:.1f}s", flush=True)
+
+                upsert_coverage(conn, ym, st, "loaded", total_rows)
+
+            ok += 1
+            print(f"[JOB {i}] DONE OK | batches={batch_idx} | rows_loaded={total_rows} | time={time.time()-t_job:.2f}s", flush=True)
+
+        except Exception as e:
+            failed += 1
+            print(f"[JOB {i}] FAILED DB load | {type(e).__name__}: {e}", flush=True)
+            with engine.begin() as conn:
+                upsert_coverage(conn, ym, st, "failed", None)
+
+        finally:
+            # liberar dataset + borrar parquet local para no llenar disco
+            try:
+                del dataset
+            except Exception:
+                pass
+            gc.collect()
+
+            try:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                    print(f"[JOB {i}] Cleaned local file: {local_path}", flush=True)
+            except Exception as e:
+                print(f"[JOB {i}] WARN no pude borrar local file | {e}", flush=True)
+
+        print(f"[GLOBAL] ok={ok} | missing={missing} | failed={failed}", flush=True)
+
+    total_s = time.time() - t_all
+    print("\n" + "=" * 110, flush=True)
+    print("[DONE] INGEST FINALIZADO (STREAMING + LOCAL DOWNLOAD)", flush=True)
+    print(f"[SUMMARY] ok={ok} | missing={missing} | failed={failed} | total={total}", flush=True)
+    print(f"[SUMMARY] total_time={(total_s/60):.2f} min", flush=True)
+    print("=" * 110, flush=True)
+
+    return {"total": total, "ok": ok, "missing": missing, "failed": failed}
+

@@ -1,0 +1,288 @@
+import time
+import gc
+from datetime import datetime
+
+import pandas as pd
+import pyarrow.dataset as ds
+from sqlalchemy import create_engine, text
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+
+if 'data_exporter' not in globals():
+    from mage_ai.data_preparation.decorators import data_exporter
+
+
+# -----------------------------
+# Conexión a Postgres (Mage Secrets)
+# -----------------------------
+def pg_engine():
+    host = get_secret_value("POSTGRES_HOST")
+    port = get_secret_value("POSTGRES_PORT") or "5432"
+    db   = get_secret_value("POSTGRES_DB")
+    user = get_secret_value("POSTGRES_USER")
+    pwd  = get_secret_value("POSTGRES_PASSWORD")
+    return create_engine(f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}")
+
+
+# -----------------------------
+# DDL: schema + tablas + índice
+# -----------------------------
+def ensure_bronze_tables(conn):
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS bronze;"))
+
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS bronze.trips_raw (
+          ingest_ts     TIMESTAMP NOT NULL,
+          source_month  TEXT      NOT NULL,
+          service_type  TEXT      NOT NULL,
+
+          vendorid              INTEGER NULL,
+          tpep_pickup_datetime  TIMESTAMP NULL,
+          tpep_dropoff_datetime TIMESTAMP NULL,
+          lpep_pickup_datetime  TIMESTAMP NULL,
+          lpep_dropoff_datetime TIMESTAMP NULL,
+
+          passenger_count       NUMERIC NULL,
+          trip_distance         NUMERIC NULL,
+
+          pulocationid          INTEGER NULL,
+          dolocationid          INTEGER NULL,
+
+          ratecodeid            NUMERIC NULL,
+          store_and_fwd_flag    TEXT NULL,
+
+          payment_type          INTEGER NULL,
+
+          fare_amount           NUMERIC NULL,
+          extra                 NUMERIC NULL,
+          mta_tax               NUMERIC NULL,
+          tip_amount            NUMERIC NULL,
+          tolls_amount          NUMERIC NULL,
+          improvement_surcharge NUMERIC NULL,
+          total_amount          NUMERIC NULL,
+          congestion_surcharge  NUMERIC NULL,
+          airport_fee           NUMERIC NULL,
+
+          ehail_fee             NUMERIC NULL,
+          trip_type             NUMERIC NULL
+        );
+    """))
+
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS idx_trips_raw_month_service
+        ON bronze.trips_raw (source_month, service_type);
+    """))
+
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS bronze.ingest_coverage (
+          year_month   TEXT NOT NULL,
+          service_type TEXT NOT NULL,
+          status       TEXT NOT NULL,
+          row_count    BIGINT NULL,
+          updated_ts   TIMESTAMP NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (year_month, service_type)
+        );
+    """))
+
+
+# -----------------------------
+# Alinear DF al schema objetivo
+# -----------------------------
+TARGET_COLS = [
+    "ingest_ts", "source_month", "service_type",
+    "vendorid",
+    "tpep_pickup_datetime", "tpep_dropoff_datetime",
+    "lpep_pickup_datetime", "lpep_dropoff_datetime",
+    "passenger_count", "trip_distance",
+    "pulocationid", "dolocationid",
+    "ratecodeid", "store_and_fwd_flag",
+    "payment_type",
+    "fare_amount", "extra", "mta_tax", "tip_amount", "tolls_amount",
+    "improvement_surcharge", "total_amount", "congestion_surcharge", "airport_fee",
+    "ehail_fee", "trip_type",
+]
+
+def align_to_target_schema(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.lower() for c in df.columns]
+
+    # Algunos datasets pueden variar nombres; dejamos mapeos mínimos útiles
+    rename_map = {
+        "pu_locationid": "pulocationid",
+        "do_locationid": "dolocationid",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # agrega columnas faltantes como NULL
+    for c in TARGET_COLS:
+        if c not in df.columns:
+            df[c] = None
+
+    # elimina columnas extra (para que no falle el INSERT)
+    df = df[TARGET_COLS]
+    return df
+
+
+# -----------------------------
+# Exporter: streaming por batches
+# -----------------------------
+@data_exporter
+def export_data(data, *args, **kwargs):
+    """
+    data: lista de jobs desde el loader (yellow+green), cada job trae:
+      - year_month
+      - service_type
+      - url_parquet
+    """
+
+    # 0) Unwrap por si Mage envuelve el output
+    jobs = data
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, list):
+                jobs = v
+                break
+
+    if not isinstance(jobs, list) or not jobs:
+        raise ValueError(f"Se esperaba lista de jobs. Llegó: {type(data)}")
+
+    # Parámetros ajustables (puedes pasarlos como runtime vars)
+    batch_size = int(kwargs.get("batch_size", 100_000))     # lectura parquet -> batches
+    chunksize  = int(kwargs.get("chunksize", 20_000))       # escritura SQL -> chunks
+
+    engine = pg_engine()
+    total = len(jobs)
+
+    ok = 0
+    missing = 0
+    failed = 0
+
+    print("=" * 100)
+    print("[START] Data Exporter (STREAMING): ingest Bronze taxi (Yellow + Green) job por job")
+    print(f"[INFO] Jobs a procesar: {total}")
+    print(f"[INFO] batch_size (read): {batch_size}")
+    print(f"[INFO] chunksize  (sql):  {chunksize}")
+    print("=" * 100)
+
+    # 1) Asegura tablas
+    with engine.begin() as conn:
+        ensure_bronze_tables(conn)
+    print("[INIT] Tablas bronze aseguradas (trips_raw, ingest_coverage)")
+
+    t_all = time.time()
+
+    for i, job in enumerate(jobs, start=1):
+        ym = job.get("year_month")
+        st = job.get("service_type")
+        url = job.get("url_parquet")
+
+        print("\n" + "-" * 100)
+        print(f"[JOB {i}/{total}] {st} {ym}")
+        print(f"[JOB {i}] url={url}")
+
+        # 2) Crear dataset parquet (no carga todo en RAM)
+        try:
+            t0 = time.time()
+            dataset = ds.dataset(url, format="parquet")
+            print(f"[JOB {i}] dataset OK | time={time.time()-t0:.2f}s")
+        except Exception as e:
+            missing += 1
+            print(f"[JOB {i}] MISSING/ERROR creando dataset | {type(e).__name__}: {e}")
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO bronze.ingest_coverage(year_month, service_type, status, row_count, updated_ts)
+                    VALUES (:ym, :st, 'missing', NULL, NOW())
+                    ON CONFLICT (year_month, service_type)
+                    DO UPDATE SET status='missing', row_count=NULL, updated_ts=NOW()
+                """), {"ym": ym, "st": st})
+            continue
+
+        # 3) DB load streaming: borrar mes+servicio una sola vez y luego insertar batches
+        total_rows_loaded = 0
+        t_job = time.time()
+
+        try:
+            with engine.begin() as conn:
+                # Idempotencia por mes+servicio
+                conn.execute(
+                    text("DELETE FROM bronze.trips_raw WHERE source_month = :ym AND service_type = :st"),
+                    {"ym": ym, "st": st}
+                )
+
+                # Itera batches del parquet (esto es lo que evita OOM)
+                batch_idx = 0
+                for record_batch in dataset.to_batches(batch_size=batch_size):
+                    batch_idx += 1
+                    df_chunk = record_batch.to_pandas()  # solo este chunk vive en RAM
+
+                    # metadata por chunk
+                    df_chunk["ingest_ts"] = datetime.utcnow()
+                    df_chunk["source_month"] = ym
+                    df_chunk["service_type"] = st
+
+                    # alinear schema para evitar fallos por columnas extra/faltantes
+                    df_chunk = align_to_target_schema(df_chunk)
+
+                    # insert chunk
+                    df_chunk.to_sql(
+                        name="trips_raw",
+                        con=conn,
+                        schema="bronze",
+                        if_exists="append",
+                        index=False,
+                        method="multi",
+                        chunksize=chunksize
+                    )
+
+                    total_rows_loaded += len(df_chunk)
+
+                    # libera memoria del chunk
+                    del df_chunk
+                    gc.collect()
+
+                    if batch_idx % 5 == 0:
+                        print(f"[JOB {i}] progress batches={batch_idx} | rows_loaded={total_rows_loaded}")
+
+                # Coverage loaded
+                conn.execute(text("""
+                    INSERT INTO bronze.ingest_coverage(year_month, service_type, status, row_count, updated_ts)
+                    VALUES (:ym, :st, 'loaded', :rc, NOW())
+                    ON CONFLICT (year_month, service_type)
+                    DO UPDATE SET status='loaded', row_count=:rc, updated_ts=NOW()
+                """), {"ym": ym, "st": st, "rc": total_rows_loaded})
+
+            ok += 1
+            print(f"[JOB {i}] DB OK | rows_loaded={total_rows_loaded} | time={time.time()-t_job:.2f}s")
+            print(f"[PROGRESS] ok={ok} | missing={missing} | failed={failed}")
+
+        except Exception as e:
+            failed += 1
+            print(f"[JOB {i}] FAILED cargando a DB | {type(e).__name__}: {e}")
+
+            # intenta registrar coverage failed (si DB sigue viva)
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text("""
+                        INSERT INTO bronze.ingest_coverage(year_month, service_type, status, row_count, updated_ts)
+                        VALUES (:ym, :st, 'failed', NULL, NOW())
+                        ON CONFLICT (year_month, service_type)
+                        DO UPDATE SET status='failed', row_count=NULL, updated_ts=NOW()
+                    """), {"ym": ym, "st": st})
+            except Exception:
+                pass
+
+        finally:
+            # libera dataset
+            try:
+                del dataset
+            except Exception:
+                pass
+            gc.collect()
+
+    total_s = time.time() - t_all
+    print("\n" + "=" * 100)
+    print("[DONE] Ingest Bronze FINALIZADO (STREAMING)")
+    print(f"[SUMMARY] ok={ok} | missing={missing} | failed={failed} | total={total}")
+    print(f"[SUMMARY] total_time={(total_s/60):.2f} min")
+    print("=" * 100)
+
+    return {"total": total, "ok": ok, "missing": missing, "failed": failed}

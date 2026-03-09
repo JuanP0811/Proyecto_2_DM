@@ -1,0 +1,250 @@
+if "data_loader" not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+if "test" not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+import os
+import pandas as pd
+from datetime import datetime, timezone
+import psycopg2
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _normalize_month(m: int) -> str:
+    if m < 1 or m > 12:
+        raise ValueError(f"Invalid month: {m}")
+    return f"{m:02d}"
+
+
+def _month_range(start_ym: str, end_ym: str) -> list[str]:
+    """Inclusive range of YYYY-MM strings."""
+    sy, sm = map(int, start_ym.split("-"))
+    ey, em = map(int, end_ym.split("-"))
+
+    out = []
+    y, m = sy, sm
+    while (y < ey) or (y == ey and m <= em):
+        out.append(f"{y}-{_normalize_month(m)}")
+        m += 1
+        if m == 13:
+            m = 1
+            y += 1
+    return out
+
+
+def _build_tlc_parquet_url(service_type: str, year_month: str) -> str:
+    # Example:
+    # https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet
+    st = service_type.lower().strip()
+    if st not in {"yellow", "green"}:
+        raise ValueError("service_type must be 'yellow' or 'green'")
+    return f"https://d37ci6vzurychx.cloudfront.net/trip-data/{st}_tripdata_{year_month}.parquet"
+
+
+def _pg_conn_from_env():
+    host = os.getenv("POSTGRES_HOST", "warehouse")
+    port = int(os.getenv("POSTGRES_PORT", "5432"))
+    db = os.getenv("POSTGRES_DB", "qbo")
+    user = os.getenv("POSTGRES_USER", "root")
+    pwd = os.getenv("POSTGRES_PASSWORD", "root")
+
+    return psycopg2.connect(
+        host=host,
+        port=port,
+        dbname=db,
+        user=user,
+        password=pwd,
+    )
+
+
+# -----------------------------
+# State (so it advances without exporter)
+# -----------------------------
+def _ensure_state_table(cur, default_start_ym: str):
+    cur.execute("CREATE SCHEMA IF NOT EXISTS bronze;")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bronze.ingest_state (
+            id              INT PRIMARY KEY DEFAULT 1,
+            year_month      TEXT NOT NULL,
+            service_type    TEXT NOT NULL,
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    # Create row if it doesn't exist
+    cur.execute(
+        """
+        INSERT INTO bronze.ingest_state (id, year_month, service_type)
+        VALUES (1, %s, 'yellow')
+        ON CONFLICT (id) DO NOTHING;
+        """,
+        (default_start_ym,),
+    )
+
+
+def _get_state(cur) -> tuple[str, str]:
+    cur.execute("SELECT year_month, service_type FROM bronze.ingest_state WHERE id = 1;")
+    return cur.fetchone()
+
+
+def _set_state(cur, year_month: str, service_type: str):
+    cur.execute(
+        """
+        UPDATE bronze.ingest_state
+        SET year_month = %s,
+            service_type = %s,
+            updated_at = NOW()
+        WHERE id = 1;
+        """,
+        (year_month, service_type),
+    )
+
+
+def _advance(ym: str, st: str, start_ym: str, end_ym: str) -> tuple[str | None, str | None]:
+    """
+    Order:
+      - yellow from start_ym..end_ym
+      - then green from start_ym..end_ym
+      - then finish (None, None)
+    """
+    months = _month_range(start_ym, end_ym)
+
+    if ym not in months:
+        return start_ym, "yellow"
+
+    idx = months.index(ym)
+
+    if st == "yellow":
+        if idx < len(months) - 1:
+            return months[idx + 1], "yellow"
+        # finished yellow range -> jump to first green
+        return start_ym, "green"
+
+    # st == "green"
+    if idx < len(months) - 1:
+        return months[idx + 1], "green"
+
+    # finished green range
+    return None, None
+
+
+# -----------------------------
+# Mage Data Loader
+# -----------------------------
+@data_loader
+def load_data(*args, **kwargs):
+    """
+    Anti-saturation loader:
+      - loads ONLY 1 parquet per run (1 month + 1 service_type)
+      - prints progress
+      - announces when finishing yellow and switching to green, and when finishing green
+      - uses bronze.ingest_state to advance even without an exporter
+    """
+
+    # 🔒 Safe defaults for testing; expand later via env vars
+    START_YM = os.getenv("INGEST_START_YM", "2024-01")
+    END_YM = os.getenv("INGEST_END_YM", "2024-03")
+
+    print("\n" + "=" * 60)
+    print("🚀 Starting ingestion run")
+    print(f"🗓️  Range: {START_YM} -> {END_YM}")
+    print("=" * 60)
+
+    conn = _pg_conn_from_env()
+
+    try:
+        # Read current state
+        with conn:
+            with conn.cursor() as cur:
+                _ensure_state_table(cur, START_YM)
+                ym, service_type = _get_state(cur)
+
+        # Handle terminal state
+        if service_type == "done":
+            print("🏁 Ingestion already completed (state=done).")
+            return []
+
+        print(f"📌 Current state: {service_type.upper()} {ym}")
+
+        ingest_ts = datetime.now(timezone.utc)
+        url = _build_tlc_parquet_url(service_type, ym)
+
+        print(f"⬇️  Reading parquet: {url}")
+        df = pd.read_parquet(url, engine="pyarrow")
+
+        print(f"✅ Loaded rows: {len(df):,} | {service_type.upper()} {ym}")
+
+        # Add lineage columns
+        df["ingest_ts"] = ingest_ts
+        df["source_month"] = ym
+        df["service_type"] = service_type
+
+        # Compute next state
+        next_ym, next_st = _advance(ym, service_type, START_YM, END_YM)
+
+        # Announcements
+        if service_type == "yellow" and next_st == "green":
+            print("🎉 Finished ALL YELLOW in the range.")
+            print("🟢 Switching to GREEN...")
+
+        if service_type == "green" and next_ym is None:
+            print("🎉 Finished ALL GREEN in the range.")
+            print("🏁 Ingestion fully completed.")
+
+        # Persist next state (only after success)
+        with conn:
+            with conn.cursor() as cur:
+                if next_ym is None:
+                    _set_state(cur, END_YM, "done")
+                else:
+                    _set_state(cur, next_ym, next_st)
+
+        print("✅ Run finished successfully.")
+        print("=" * 60 + "\n")
+
+        return [
+            {
+                "df": df,
+                "year_month": ym,
+                "service_type": service_type,
+                "status": "loaded",
+                "error": None,
+            }
+        ]
+
+    except Exception as e:
+        # Do NOT advance state on failure
+        print("❌ ERROR during ingestion:")
+        print(str(e))
+        print("=" * 60 + "\n")
+        return [
+            {
+                "df": None,
+                "year_month": None,
+                "service_type": None,
+                "status": "failed",
+                "error": str(e),
+            }
+        ]
+    finally:
+        conn.close()
+
+
+# -----------------------------
+# Tests
+# -----------------------------
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "Output is undefined"
+    assert isinstance(output, list), "Expected a list"
+    assert len(output) in (0, 1), "This loader returns at most 1 chunk per run"
+
+    if len(output) == 0:
+        return
+
+    item = output[0]
+    assert "status" in item
+    assert "df" in item

@@ -1,0 +1,38 @@
+{{ config(materialized='table') }}
+
+with bounds as (
+    select
+        min(date_trunc('day', pickup_ts))::date  as min_date,
+        max(date_trunc('day', dropoff_ts))::date as max_date
+    from {{ ref('trips_silver') }}
+),
+
+dates as (
+    select
+        generate_series(min_date, max_date, interval '1 day')::date as date_day
+    from bounds
+),
+
+dim as (
+    select
+        date_day,
+        to_char(date_day, 'YYYY-MM-DD') as date_iso,
+
+        extract(isodow from date_day)::int as day_of_week_iso,  -- 1=lunes ... 7=domingo
+        trim(to_char(date_day, 'Day')) as day_name,
+        extract(day from date_day)::int as day_of_month,
+        extract(doy from date_day)::int as day_of_year,
+
+        extract(week from date_day)::int as week_of_year,
+        extract(month from date_day)::int as month,
+        trim(to_char(date_day, 'Month')) as month_name,
+        extract(quarter from date_day)::int as quarter,
+        extract(year from date_day)::int as year,
+
+        case when extract(isodow from date_day) in (6,7) then true else false end as is_weekend
+    from dates
+)
+
+select *
+from dim
+order by date_day

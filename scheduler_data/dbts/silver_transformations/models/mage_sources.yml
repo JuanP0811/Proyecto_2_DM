@@ -1,0 +1,14 @@
+sources:
+- description: Dataframes Mage upstream blocks
+  loader: mage
+  name: mage_silver_transformations
+  schema: silver
+  tables:
+  - description: Dataframe for block `data_exporter_taxi` of the `ingest_bronze` mage
+      pipeline.
+    identifier: mage_ingest_bronze_data_exporter_taxi
+    meta:
+      block_uuid: data_exporter_taxi
+      pipeline_uuid: ingest_bronze
+    name: ingest_bronze_data_exporter_taxi
+version: 2

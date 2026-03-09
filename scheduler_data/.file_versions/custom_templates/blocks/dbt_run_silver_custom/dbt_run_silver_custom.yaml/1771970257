@@ -1,0 +1,7 @@
+command: run
+args:
+  - "--select"
+  - "silver"
+project_dir: "dbts/silver_transformations"
+profiles_dir: "profiles"
+target: "dev"

@@ -1,0 +1,101 @@
+import csv
+import io
+import os
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+if 'data_loader' not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+
+DEFAULT_TAXI_ZONE_URL = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv"
+
+
+def _download_bytes(url: str, timeout: int = 60, retries: int = 3, backoff: float = 2.0) -> bytes:
+    last_err = None
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "mage-ai/pset2 (taxi_zone_loader)",
+                    "Accept": "text/csv,*/*",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception as e:
+            last_err = e
+            if i < retries - 1:
+                time.sleep(backoff ** i)
+    raise RuntimeError(f"Failed to download taxi zone lookup CSV after {retries} attempts. Last error: {last_err}")
+
+
+@data_loader
+def load_data(*args, **kwargs):
+    """
+    Loads NYC TLC Taxi Zone Lookup Table (CSV) and returns a list of dict rows.
+
+    Output schema (keys):
+      - location_id (int)
+      - borough (str)
+      - zone (str)
+      - service_zone (str)
+      - ingest_ts (ISO string)  # helpful metadata
+      - source_url (str)        # helpful metadata
+    """
+    url = kwargs.get("url") or os.getenv("TAXI_ZONE_LOOKUP_URL") or DEFAULT_TAXI_ZONE_URL
+
+    raw = _download_bytes(url=url, timeout=int(os.getenv("HTTP_TIMEOUT_SEC", "60")))
+
+    # Handle possible BOM and ensure text decoding
+    text = raw.decode("utf-8-sig", errors="replace")
+    f = io.StringIO(text)
+
+    reader = csv.DictReader(f)
+    required_cols = {"LocationID", "Borough", "Zone", "service_zone"}
+    if reader.fieldnames is None:
+        raise ValueError("CSV has no header row (fieldnames is None).")
+    missing = required_cols - set(reader.fieldnames)
+    if missing:
+        raise ValueError(f"Taxi zone CSV is missing expected columns: {sorted(missing)}. Found: {reader.fieldnames}")
+
+    ingest_ts = datetime.now(timezone.utc).isoformat()
+
+    rows = []
+    for r in reader:
+        # Basic normalization + typing
+        loc_raw = (r.get("LocationID") or "").strip()
+        if not loc_raw:
+            continue
+
+        try:
+            location_id = int(loc_raw)
+        except ValueError:
+            # Skip weird rows safely
+            continue
+
+        rows.append({
+            "location_id": location_id,
+            "borough": (r.get("Borough") or "").strip() or None,
+            "zone": (r.get("Zone") or "").strip() or None,
+            "service_zone": (r.get("service_zone") or "").strip() or None,
+            "ingest_ts": ingest_ts,
+            "source_url": url,
+        })
+
+    return rows
+
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "The output is undefined"
+    assert isinstance(output, list), "Expected a list of dict rows"
+    assert len(output) > 0, "No rows loaded from taxi_zone_lookup.csv"
+    sample = output[0]
+    for k in ["location_id", "borough", "zone", "service_zone"]:
+        assert k in sample, f"Missing key in output rows: {k}"
+

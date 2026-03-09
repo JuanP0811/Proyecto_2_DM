@@ -1,0 +1,83 @@
+
+
+with base as (
+
+  select
+
+    ingest_ts,
+
+    source_month,
+
+    service_type,
+
+    vendorid,
+
+
+
+    -- unificamos timestamps para yellow/green
+
+    coalesce(tpep_pickup_datetime, lpep_pickup_datetime)   as pickup_ts,
+
+    coalesce(tpep_dropoff_datetime, lpep_dropoff_datetime) as dropoff_ts,
+
+
+
+    passenger_count,
+
+    trip_distance,
+
+    pulocationid,
+
+    dolocationid,
+
+    ratecodeid,
+
+    store_and_fwd_flag,
+
+    payment_type,
+
+
+
+    fare_amount,
+
+    extra,
+
+    mta_tax,
+
+    tip_amount,
+
+    tolls_amount,
+
+    improvement_surcharge,
+
+    congestion_surcharge,
+
+    airport_fee,
+
+    ehail_fee,
+
+    total_amount,
+
+    trip_type
+
+  from bronze.trips_raw
+
+)
+
+
+
+select *
+
+from base
+
+where
+
+  pickup_ts is not null
+
+  and dropoff_ts is not null
+
+  and pickup_ts <= dropoff_ts
+
+  and trip_distance >= 0
+
+  and total_amount >= 0

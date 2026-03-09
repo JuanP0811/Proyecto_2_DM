@@ -1,0 +1,111 @@
+if "data_loader" not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+if "test" not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+import os
+from datetime import datetime, timezone
+from typing import List, Dict, Any
+
+import pyarrow.dataset as ds
+
+
+# -----------------------------
+# Config
+# -----------------------------
+START_YM = os.getenv("INGEST_START_YM", "2022-01")
+END_YM = os.getenv("INGEST_END_YM", "2025-12")
+BATCH_SIZE = int(os.getenv("PARQUET_BATCH_SIZE", "200000"))
+
+# Estado simple en memoria
+CURRENT_YEAR = int(START_YM.split("-")[0])
+CURRENT_MONTH = int(START_YM.split("-")[1])
+CURRENT_SERVICE = "yellow"
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _next_month(year: int, month: int):
+    month += 1
+    if month == 13:
+        month = 1
+        year += 1
+    return year, month
+
+
+def _build_url(service: str, year: int, month: int):
+    return f"https://d37ci6vzurychx.cloudfront.net/trip-data/{service}_tripdata_{year}-{month:02d}.parquet"
+
+
+# -----------------------------
+# Loader
+# -----------------------------
+@data_loader
+def load_data(*args, **kwargs) -> List[Dict[str, Any]]:
+
+    global CURRENT_YEAR, CURRENT_MONTH, CURRENT_SERVICE
+
+    print("\n" + "=" * 60)
+    print("🚀 Starting ingestion (NO Postgres mode)")
+    print(f"📦 Current: {CURRENT_SERVICE.upper()} {CURRENT_YEAR}-{CURRENT_MONTH:02d}")
+    print("=" * 60)
+
+    # Stop condition
+    if f"{CURRENT_YEAR}-{CURRENT_MONTH:02d}" > END_YM and CURRENT_SERVICE == "green":
+        print("🏁 Finished entire range.")
+        return []
+
+    url = _build_url(CURRENT_SERVICE, CURRENT_YEAR, CURRENT_MONTH)
+    print(f"⬇️  Streaming: {url}")
+
+    dataset = ds.dataset(url, format="parquet")
+
+    chunks = []
+    total_rows = 0
+    batch_index = 0
+    ingest_ts = datetime.now(timezone.utc)
+
+    for batch in dataset.to_batches(batch_size=BATCH_SIZE):
+        df = batch.to_pandas()
+        batch_index += 1
+        total_rows += len(df)
+
+        df["ingest_ts"] = ingest_ts
+        df["source_month"] = f"{CURRENT_YEAR}-{CURRENT_MONTH:02d}"
+        df["service_type"] = CURRENT_SERVICE
+
+        print(f"  ✅ Batch {batch_index}: {len(df):,} rows")
+
+        chunks.append(
+            {
+                "df": df,
+                "year_month": f"{CURRENT_YEAR}-{CURRENT_MONTH:02d}",
+                "service_type": CURRENT_SERVICE,
+                "status": "loaded",
+                "error": None,
+            }
+        )
+
+    print(f"🎯 Finished {CURRENT_SERVICE.upper()} {CURRENT_YEAR}-{CURRENT_MONTH:02d}")
+    print(f"📊 Total rows: {total_rows:,}")
+
+    # Advance logic
+    if CURRENT_SERVICE == "yellow":
+        CURRENT_SERVICE = "green"
+        print("🟢 Switching to GREEN...")
+    else:
+        CURRENT_YEAR, CURRENT_MONTH = _next_month(CURRENT_YEAR, CURRENT_MONTH)
+        CURRENT_SERVICE = "yellow"
+
+    print("=" * 60 + "\n")
+
+    return chunks
+
+
+# -----------------------------
+# Test
+# -----------------------------
+@test
+def test_output(output, *args) -> None:
+    assert isinstance(output, list)

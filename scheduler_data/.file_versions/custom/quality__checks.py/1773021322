@@ -1,0 +1,47 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+import subprocess
+
+
+def run_command(command: str):
+    print(f" Ejecutando: {command}")
+
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+
+    for line in process.stdout:
+        print(line.strip())
+
+    process.wait()
+
+    if process.returncode != 0:
+        raise Exception(f" Error ejecutando: {command}")
+
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Ejecuta dbt tests para silver y gold
+    """
+
+    print(" Iniciando dbt tests...")
+
+    # Test para modelos silver
+    run_command("dbt test --select silver")
+
+    # Test para modelos gold
+    run_command("dbt test --select gold")
+
+    print(" dbt tests completados correctamente")
+
+    return {"status": "success"}
+
+

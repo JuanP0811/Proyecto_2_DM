@@ -1,0 +1,126 @@
+{{ config(materialized='table') }}
+
+with base as (
+
+    select
+        -- clave del hecho
+        md5(
+            coalesce(cast(pickup_ts as text), '') || '|' ||
+            coalesce(cast(dropoff_ts as text), '') || '|' ||
+            coalesce(cast(vendorid as text), '') || '|' ||
+            coalesce(cast(pulocationid as text), '') || '|' ||
+            coalesce(cast(dolocationid as text), '') || '|' ||
+            coalesce(cast(total_amount as text), '') || '|' ||
+            coalesce(cast(trip_distance as text), '') || '|' ||
+            coalesce(service_type, '') || '|' ||
+            coalesce(source_month, '')
+        ) as trip_key,
+
+        -- fechas para joins a dimensión date
+        cast(pickup_ts as date)  as pickup_date,
+        cast(dropoff_ts as date) as dropoff_date,
+
+        -- claves candidatas para dimensiones
+        pulocationid          as pu_zone_key,
+        dolocationid          as do_zone_key,
+        service_type          as service_type_key,
+        payment_type::int     as payment_type_key,
+        vendorid::int         as vendor_key,
+
+        -- timestamps del viaje
+        pickup_ts,
+        dropoff_ts,
+
+        -- medidas / métricas
+        passenger_count,
+        trip_distance,
+        extract(epoch from (dropoff_ts - pickup_ts)) / 60.0 as trip_duration_min,
+
+        fare_amount,
+        extra,
+        mta_tax,
+        tip_amount,
+        tolls_amount,
+        improvement_surcharge,
+        congestion_surcharge,
+        airport_fee,
+        ehail_fee,
+        total_amount,
+
+        -- otros atributos útiles
+        ratecodeid,
+        store_and_fwd_flag,
+        trip_type,
+        source_month
+
+    from silver.trips_silver_clean
+),
+
+validated as (
+
+    select
+        b.*
+    from base b
+    inner join gold.dim_zone pu
+        on b.pu_zone_key = pu.zone_key
+    inner join gold.dim_zone do
+        on b.do_zone_key = do.zone_key
+    inner join gold.dim_service_type st
+        on b.service_type_key = st.service_type_key
+    left join gold.dim_payment_type pt
+        on b.payment_type_key = pt.payment_type_key
+    left join gold.dim_vendor dv
+        on b.vendor_key = dv.vendor_key
+)
+
+select
+    trip_key,
+
+    -- foreign keys
+    pickup_date  as pickup_date_key,
+    dropoff_date as dropoff_date_key,
+    pu_zone_key,
+    do_zone_key,
+    service_type_key,
+    payment_type_key,
+    vendor_key,
+
+    -- timestamps
+    pickup_ts,
+    dropoff_ts,
+
+    -- métricas
+    passenger_count,
+    trip_distance,
+    trip_duration_min,
+    fare_amount,
+    extra,
+    mta_tax,
+    tip_amount,
+    tolls_amount,
+    improvement_surcharge,
+    congestion_surcharge,
+    airport_fee,
+    ehail_fee,
+    total_amount,
+
+    -- derivados útiles
+    case
+        when fare_amount > 0 then tip_amount / fare_amount
+        else null
+    end as tip_pct,
+
+    case
+        when extract(epoch from (dropoff_ts - pickup_ts)) > 0
+             and trip_distance is not null
+        then trip_distance / (extract(epoch from (dropoff_ts - pickup_ts)) / 3600.0)
+        else null
+    end as avg_speed_mph,
+
+    -- atributos auxiliares
+    ratecodeid,
+    store_and_fwd_flag,
+    trip_type,
+    source_month
+
+from validated

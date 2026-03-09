@@ -1,0 +1,1 @@
+{"status": "success", "command": "dbt run --select models/silver --target dev --project-dir /home/src/dbt_project --profiles-dir /root/.dbt", "project_dir": "/home/src/dbt_project", "profiles_dir": "/root/.dbt", "target": "dev", "select": "models/silver"}

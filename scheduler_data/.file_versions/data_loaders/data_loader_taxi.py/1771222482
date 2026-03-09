@@ -1,0 +1,119 @@
+import pandas as pd
+import time
+import gc
+
+if 'data_loader' not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+
+def make_url(year: int, month: int) -> str:
+    return (
+        f"https://d37ci6vzurychx.cloudfront.net/trip-data/"
+        f"yellow_tripdata_{year}-{month:02d}.parquet"
+    )
+
+
+@data_loader
+def load_data(*args, **kwargs):
+    years = [2022, 2023, 2024, 2025]
+
+    # Tamaño del batch: cuántos meses se descargan y concatenan a la vez
+    # Recomendado: 1–3. Si tu máquina aguanta, 6.
+    BATCH_SIZE = int(kwargs.get("batch_size", 2))
+
+    # Construye la lista de meses (48)
+    jobs = [(y, m) for y in years for m in range(1, 13)]
+    total_jobs = len(jobs)
+    total_batches = (total_jobs + BATCH_SIZE - 1) // BATCH_SIZE
+
+    print("=" * 80)
+    print("[START] Yellow Taxi 2022-2025 | Data loader por batches")
+    print(f"[INFO] Total meses: {total_jobs} | Batch size: {BATCH_SIZE} | Total batches: {total_batches}")
+    print("=" * 80)
+
+    all_dfs = []
+    ok_months = 0
+    err_months = 0
+    t_all = time.time()
+
+    for b in range(total_batches):
+        start = b * BATCH_SIZE
+        end = min(start + BATCH_SIZE, total_jobs)
+        batch_jobs = jobs[start:end]
+
+        print("\n" + "-" * 80)
+        print(f"[BATCH {b+1}/{total_batches}] Procesando meses {start+1}-{end} de {total_jobs}: "
+              f"{batch_jobs[0][0]}-{batch_jobs[0][1]:02d} -> {batch_jobs[-1][0]}-{batch_jobs[-1][1]:02d}")
+        print("-" * 80)
+
+        batch_dfs = []
+        t_batch = time.time()
+
+        for (year, month) in batch_jobs:
+            ym = f"{year}-{month:02d}"
+            url = make_url(year, month)
+            print(f"[MONTH] Descargando {ym} | {url}")
+
+            t_m = time.time()
+            try:
+                df = pd.read_parquet(url, engine="pyarrow")
+                df.columns = [c.lower() for c in df.columns]  # normalize
+
+                # metadata mínima
+                df["source_month"] = ym
+                df["service_type"] = "yellow"
+
+                batch_dfs.append(df)
+                ok_months += 1
+                print(f"[MONTH] OK {ym} | shape={df.shape} | time={time.time() - t_m:.2f}s")
+
+            except Exception as e:
+                err_months += 1
+                print(f"[MONTH] ERROR {ym} | {type(e).__name__}: {e}")
+                continue
+
+        # Concatena solo el batch (si hay algo)
+        if batch_dfs:
+            df_batch = pd.concat(batch_dfs, ignore_index=True)
+            all_dfs.append(df_batch)
+
+            print(f"[BATCH {b+1}] CONCAT OK | batch_rows={df_batch.shape[0]} | "
+                  f"batch_cols={df_batch.shape[1]} | time={time.time() - t_batch:.2f}s")
+        else:
+            print(f"[BATCH {b+1}] SIN DATOS (todos fallaron en este batch)")
+
+        # Limpia referencias del batch para liberar memoria
+        del batch_dfs
+        gc.collect()
+
+        print(f"[PROGRESS] OK_months={ok_months} | ERR_months={err_months}")
+
+    # Concat final (ojo: puede ser enorme si intentas 4 años completos)
+    if not all_dfs:
+        print("[END] No se cargó ningún mes. Retornando None.")
+        return None
+
+    print("\n" + "=" * 80)
+    print("[FINAL CONCAT] Uniendo todos los batches en un solo DataFrame...")
+    t_final = time.time()
+    df_all = pd.concat(all_dfs, ignore_index=True)
+    del all_dfs
+    gc.collect()
+
+    print(f"[DONE] Yellow Taxi cargado COMPLETO.")
+    print(f"[SUMMARY] Months OK={ok_months} | Months ERR={err_months}")
+    print(f"[SUMMARY] Final shape={df_all.shape} | final_concat_time={time.time() - t_final:.2f}s")
+    print(f"[SUMMARY] Total time={(time.time() - t_all)/60:.2f} min")
+    print("=" * 80)
+
+    return df_all
+
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "El output es undefined"
+    assert isinstance(output, pd.DataFrame), "Se esperaba un DataFrame final"
+    assert "source_month" in output.columns, "Falta source_month"
+    assert "service_type" in output.columns, "Falta service_type"

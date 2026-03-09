@@ -1,0 +1,60 @@
+DROP TABLE IF EXISTS gold.dim_zone CASCADE;
+
+CREATE TABLE gold.dim_zone (
+    zone_key      INT NOT NULL,
+    borough       TEXT,
+    zone          TEXT,
+    service_zone  TEXT,
+    PRIMARY KEY (zone_key)
+) PARTITION BY HASH (zone_key);
+
+CREATE TABLE gold.dim_zone_p0
+PARTITION OF gold.dim_zone
+FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+
+CREATE TABLE gold.dim_zone_p1
+PARTITION OF gold.dim_zone
+FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+
+CREATE TABLE gold.dim_zone_p2
+PARTITION OF gold.dim_zone
+FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+
+CREATE TABLE gold.dim_zone_p3
+PARTITION OF gold.dim_zone
+FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+
+INSERT INTO gold.dim_zone (
+    zone_key,
+    borough,
+    zone,
+    service_zone
+)
+WITH all_zones AS (
+
+    SELECT
+        pulocationid     AS zone_key,
+        pu_borough       AS borough,
+        pu_zone          AS zone,
+        pu_service_zone  AS service_zone
+    FROM silver.trips_silver_clean
+    WHERE pulocationid IS NOT NULL
+
+    UNION
+
+    SELECT
+        dolocationid     AS zone_key,
+        do_borough       AS borough,
+        do_zone          AS zone,
+        do_service_zone  AS service_zone
+    FROM silver.trips_silver_clean
+    WHERE dolocationid IS NOT NULL
+)
+
+SELECT DISTINCT
+    zone_key,
+    borough,
+    zone,
+    service_zone
+FROM all_zones
+WHERE zone_key IS NOT NULL;

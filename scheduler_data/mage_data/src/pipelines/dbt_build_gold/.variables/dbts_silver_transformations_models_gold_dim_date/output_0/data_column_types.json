@@ -1,0 +1,1 @@
+{"date_day": "date", "date_iso": "str", "day_of_week_iso": "int64", "day_name": "str", "day_of_month": "int64", "day_of_year": "int64", "week_of_year": "int64", "month_num": "int64", "month_name": "str", "quarter": "int64", "year": "int64", "week_start_date": "date", "month_start_date": "date", "quarter_start_date": "date", "year_start_date": "date", "is_weekend": "bool"}

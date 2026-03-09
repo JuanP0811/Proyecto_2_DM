@@ -1,0 +1,22 @@
+name: 'silver_transformations'
+version: '1.0.0'
+
+# IMPORTANTE: debe apuntar al profile que existe en src/profiles/profiles.yml
+profile: 'dbt_project'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  silver_transformations:
+    silver:
+      +materialized: view
+      +schema: silver

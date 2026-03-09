@@ -1,0 +1,12 @@
+silver_transformations:
+  outputs:
+    dev:
+      dbname: qbo
+      host: warehouse
+      password: root
+      port: 5432
+      schema: silver
+      threads: 4
+      type: postgres
+      user: root
+  target: dev

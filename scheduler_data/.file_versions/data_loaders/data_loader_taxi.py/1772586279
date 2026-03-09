@@ -1,0 +1,88 @@
+if 'data_loader' not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+
+def _parse_years(value):
+    """
+    Acepta:
+    - [2024, 2025]
+    - "2024"
+    - "2024,2025"
+    - "2022-2025"
+    - None -> default [2022,2023,2024,2025]
+    """
+    if value is None:
+        return [2022, 2023, 2024, 2025]
+
+    # Si trigger manda lista real
+    if isinstance(value, (list, tuple)):
+        out = []
+        for x in value:
+            try:
+                out.append(int(x))
+            except Exception:
+                pass
+        return sorted(list(set(out))) if out else [2022, 2023, 2024, 2025]
+
+    # Si trigger manda string
+    s = str(value).strip()
+    if not s:
+        return [2022, 2023, 2024, 2025]
+
+    # Rango tipo "2022-2025"
+    if "-" in s and "," not in s:
+        a, b = s.split("-", 1)
+        a = int(a.strip())
+        b = int(b.strip())
+        if a > b:
+            a, b = b, a
+        return list(range(a, b + 1))
+
+    # Lista tipo "2024,2025"
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    years = [int(p) for p in parts]
+    return sorted(list(set(years)))
+
+
+@data_loader
+def load_data(*args, **kwargs):
+    years = _parse_years(kwargs.get("years"))
+    services = ["yellow", "green"]  # fijo (como pediste)
+
+    base_url = "https://d37ci6vzurychx.cloudfront.net/trip-data"
+    source_page = "https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page"
+
+    jobs = []
+    for s in services:
+        prefix = f"{s}_tripdata"
+        for y in years:
+            for m in range(1, 13):
+                mm = f"{m:02d}"
+                jobs.append({
+                    "year": y,
+                    "month": m,
+                    "year_month": f"{y}-{mm}",
+                    "service_type": s,
+                    "url_parquet": f"{base_url}/{prefix}_{y}-{mm}.parquet",
+                    "source_page": source_page,
+                })
+
+    print("=" * 80)
+    print("[DONE] Jobs generados")
+    print(f"[INFO] years={years} | services={services}")
+    print(f"[INFO] Total jobs: {len(jobs)} (= {len(years)}*12*2)")
+    print(f"[INFO] First job: {jobs[0] if jobs else None}")
+    print(f"[INFO] Last job : {jobs[-1] if jobs else None}")
+    print("=" * 80)
+    return jobs
+
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "Output undefined"
+    assert isinstance(output, list), "Output debe ser list"
+    assert len(output) > 0, "Output vacío"
+    required = {"year", "month", "year_month", "service_type", "url_parquet", "source_page"}
+    assert required.issubset(output[0].keys()), f"Faltan keys en job: {required - set(output[0].keys())}"

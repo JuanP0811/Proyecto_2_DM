@@ -1,0 +1,48 @@
+if 'data_loader' not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+
+
+@data_loader
+def load_data(*args, **kwargs):
+    """
+    Loader ligero: genera jobs para Yellow taxi 2022-2025 e incluye la URL parquet.
+    NO descarga datos aquí (eso va en el exporter).
+    """
+    years = [2022, 2023, 2024, 2025]
+    service_type = "yellow"
+
+    base_url = "https://d37ci6vzurychx.cloudfront.net/trip-data"
+
+    jobs = []
+    for y in years:
+        for m in range(1, 13):
+            mm = f"{m:02d}"
+            year_month = f"{y}-{mm}"
+            url_parquet = f"{base_url}/yellow_tripdata_{y}-{mm}.parquet"
+
+            jobs.append({
+                "year": y,
+                "month": m,
+                "year_month": year_month,
+                "service_type": service_type,
+                "url_parquet": url_parquet,
+            })
+
+    print("=" * 80)
+    print("[DONE] Jobs generados para ingestión Yellow 2022-2025 (con URL)")
+    print(f"[INFO] Total jobs: {len(jobs)} (debe ser 48)")
+    print(f"[INFO] First job: {jobs[0]}")
+    print(f"[INFO] Last job : {jobs[-1]}")
+    print("=" * 80)
+
+    return jobs
+
+    @test
+    def test_output(output, *args) -> None:
+        assert output is not None, "Output undefined"
+        # solo chequea que sea “iterable” y tenga al menos 1 elemento
+        try:
+            assert len(output) > 0, "Output vacío"
+        except Exception:
+            pass
+

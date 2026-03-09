@@ -1,0 +1,193 @@
+if "data_loader" not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+if "test" not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+import os
+import tempfile
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Tuple
+
+import pyarrow.dataset as ds
+
+# Descarga por streaming (requests suele estar instalado; si no, usamos urllib)
+try:
+    import requests
+    _HAS_REQUESTS = True
+except Exception:
+    _HAS_REQUESTS = False
+    import urllib.request
+
+
+# -----------------------------
+# Config
+# -----------------------------
+START_YM = os.getenv("INGEST_START_YM", "2022-01")
+END_YM = os.getenv("INGEST_END_YM", "2025-12")
+BATCH_SIZE = int(os.getenv("PARQUET_BATCH_SIZE", "200000"))
+
+
+# -----------------------------
+# Estado simple en memoria (NO persistente)
+# Si reinicia el kernel, vuelve a START_YM
+# -----------------------------
+_CUR_YEAR = int(START_YM.split("-")[0])
+_CUR_MONTH = int(START_YM.split("-")[1])
+_CUR_SERVICE = "yellow"
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _next_month(year: int, month: int) -> Tuple[int, int]:
+    month += 1
+    if month == 13:
+        month = 1
+        year += 1
+    return year, month
+
+
+def _ym_str(year: int, month: int) -> str:
+    return f"{year}-{month:02d}"
+
+
+def _build_url(service: str, year: int, month: int) -> str:
+    return f"https://d37ci6vzurychx.cloudfront.net/trip-data/{service}_tripdata_{year}-{month:02d}.parquet"
+
+
+def _download_to_temp(url: str, suffix: str = ".parquet") -> str:
+    """
+    Download file to a temp path and return local filename.
+    """
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)  # we'll open it ourselves
+
+    if _HAS_REQUESTS:
+        with requests.get(url, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+    else:
+        # fallback
+        with urllib.request.urlopen(url, timeout=60) as resp, open(path, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+    return path
+
+
+# -----------------------------
+# Loader
+# -----------------------------
+@data_loader
+def load_data(*args, **kwargs) -> List[Dict[str, Any]]:
+    global _CUR_YEAR, _CUR_MONTH, _CUR_SERVICE
+
+    current_ym = _ym_str(_CUR_YEAR, _CUR_MONTH)
+
+    print("\n" + "=" * 70)
+    print("🚀 Starting ingestion (NO Postgres, temp download + batch read)")
+    print(f"📦 Current: {_CUR_SERVICE.upper()} {current_ym}")
+    print(f"🧩 Batch size: {BATCH_SIZE}")
+    print("=" * 70)
+
+    # Stop when passed END_YM and already finished green for that month range
+    if current_ym > END_YM and _CUR_SERVICE == "green":
+        print("🏁 Finished entire range.")
+        return []
+
+    url = _build_url(_CUR_SERVICE, _CUR_YEAR, _CUR_MONTH)
+    print(f"⬇️  Downloading parquet: {url}")
+
+    local_path = None
+    chunks: List[Dict[str, Any]] = []
+    ingest_ts = datetime.now(timezone.utc)
+
+    try:
+        # 1) Download to local temp
+        local_path = _download_to_temp(url)
+        size_mb = os.path.getsize(local_path) / (1024 * 1024)
+        print(f"✅ Downloaded to {local_path} ({size_mb:.1f} MB)")
+
+        # 2) Read local parquet in batches
+        dataset = ds.dataset(local_path, format="parquet")
+
+        total_rows = 0
+        batch_index = 0
+
+        for record_batch in dataset.to_batches(batch_size=BATCH_SIZE):
+            df = record_batch.to_pandas()
+            batch_index += 1
+            n = len(df)
+            total_rows += n
+
+            df["ingest_ts"] = ingest_ts
+            df["source_month"] = current_ym
+            df["service_type"] = _CUR_SERVICE
+
+            print(f"  ✅ Batch {batch_index}: {n:,} rows (total {total_rows:,})")
+
+            chunks.append(
+                {
+                    "df": df,
+                    "year_month": current_ym,
+                    "service_type": _CUR_SERVICE,
+                    "status": "loaded",
+                    "error": None,
+                    "batch_index": batch_index,
+                    "batch_rows": n,
+                }
+            )
+
+        print(f"🎯 Finished {_CUR_SERVICE.upper()} {current_ym} | rows={total_rows:,} | batches={batch_index}")
+
+        # 3) Advance state + messages
+        if _CUR_SERVICE == "yellow":
+            _CUR_SERVICE = "green"
+            print("🎉 Finished YELLOW for this month.")
+            print("🟢 Switching to GREEN...")
+        else:
+            print("🎉 Finished GREEN for this month.")
+            _CUR_YEAR, _CUR_MONTH = _next_month(_CUR_YEAR, _CUR_MONTH)
+            _CUR_SERVICE = "yellow"
+            next_ym = _ym_str(_CUR_YEAR, _CUR_MONTH)
+            if next_ym > END_YM:
+                print("🏁 GREEN finished for last month in range. Ingestion completed.")
+            else:
+                print(f"➡️  Next will be YELLOW {next_ym}")
+
+        print("✅ Run finished successfully.")
+        print("=" * 70 + "\n")
+        return chunks
+
+    except Exception as e:
+        print("❌ ERROR during ingestion:")
+        print(str(e))
+        return [
+            {
+                "df": None,
+                "year_month": None,
+                "service_type": None,
+                "status": "failed",
+                "error": str(e),
+            }
+        ]
+    finally:
+        # Clean temp file
+        if local_path and os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+                print(f"🧹 Deleted temp file: {local_path}")
+            except Exception:
+                pass
+
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None
+    assert isinstance(output, list)

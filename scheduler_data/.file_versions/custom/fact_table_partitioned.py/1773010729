@@ -1,0 +1,133 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+
+
+@custom
+def transform_custom(*args, **kwargs):
+    import psycopg2
+    from datetime import date
+    from mage_ai.data_preparation.shared.secrets import get_secret_value
+    import time
+
+    print("🔹 Iniciando particionamiento de gold.fct_trips...")
+
+    start_time = time.time()
+
+    host = get_secret_value('POSTGRES_HOST')
+    port = int(get_secret_value('POSTGRES_PORT'))
+    dbname = get_secret_value('POSTGRES_DB')
+    user = get_secret_value('POSTGRES_USER')
+    password = get_secret_value('POSTGRES_PASSWORD')
+
+    print(f"🔹 Conectando a Postgres en {host}:{port}...")
+
+    conn = psycopg2.connect(
+        host=host,
+        port=port,
+        dbname=dbname,
+        user=user,
+        password=password
+    )
+    conn.autocommit = False
+
+    try:
+        cur = conn.cursor()
+
+        print("🔹 Detectando rango de fechas en gold.fct_trips...")
+
+        cur.execute("""
+            SELECT
+                MIN(pickup_date)::date AS min_date,
+                MAX(pickup_date)::date AS max_date
+            FROM gold.fct_trips
+            WHERE pickup_date IS NOT NULL
+        """)
+        min_date, max_date = cur.fetchone()
+
+        if min_date is None or max_date is None:
+            raise Exception('❌ No se encontró rango de pickup_date en gold.fct_trips.')
+
+        print(f"✅ Rango detectado: {min_date} → {max_date}")
+
+        start_month = min_date.replace(day=1)
+        end_month = max_date.replace(day=1)
+
+        print("🔹 Eliminando tabla particionada anterior si existe...")
+        cur.execute("DROP TABLE IF EXISTS gold.fct_trips_partitioned CASCADE;")
+
+        print("🔹 Creando tabla padre particionada...")
+
+        cur.execute("""
+            CREATE TABLE gold.fct_trips_partitioned
+            (LIKE gold.fct_trips INCLUDING DEFAULTS)
+            PARTITION BY RANGE (pickup_date);
+        """)
+
+        print("🔹 Creando particiones mensuales...")
+
+        partitions_created = []
+        current = start_month
+
+        while current <= end_month:
+            if current.month == 12:
+                next_month = date(current.year + 1, 1, 1)
+            else:
+                next_month = date(current.year, current.month + 1, 1)
+
+            partition_name = f"fct_trips_partitioned_{current.year}_{current.month:02d}"
+            partitions_created.append(partition_name)
+
+            print(f"   ➜ Creando partición {partition_name}")
+
+            cur.execute(f"""
+                CREATE TABLE gold.{partition_name}
+                PARTITION OF gold.fct_trips_partitioned
+                FOR VALUES FROM (%s) TO (%s);
+            """, (current, next_month))
+
+            current = next_month
+
+        print(f"✅ {len(partitions_created)} particiones creadas correctamente.")
+
+        print("🔹 Insertando datos en tabla particionada...")
+
+        insert_start = time.time()
+
+        cur.execute("""
+            INSERT INTO gold.fct_trips_partitioned
+            SELECT *
+            FROM gold.fct_trips;
+        """)
+
+        insert_time = round(time.time() - insert_start, 2)
+        print(f"✅ Inserción completada en {insert_time} segundos.")
+
+        print("🔹 Contando filas finales...")
+
+        cur.execute("SELECT COUNT(*) FROM gold.fct_trips_partitioned;")
+        row_count = cur.fetchone()[0]
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        total_time = round(time.time() - start_time, 2)
+
+        print("🎉 Particionamiento completado exitosamente.")
+        print(f"📊 Total filas insertadas: {row_count}")
+        print(f"⏱ Tiempo total: {total_time} segundos")
+
+        return {
+            'status': 'success',
+            'rows_inserted': row_count,
+            'partitions_created': partitions_created,
+            'min_pickup_date': str(min_date),
+            'max_pickup_date': str(max_date),
+            'execution_time_seconds': total_time
+        }
+
+    except Exception as e:
+        print("❌ Error detectado, haciendo rollback...")
+        conn.rollback()
+        conn.close()
+        raise e

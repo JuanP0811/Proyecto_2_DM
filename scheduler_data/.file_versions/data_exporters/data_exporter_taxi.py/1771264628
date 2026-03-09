@@ -1,0 +1,255 @@
+import time
+import gc
+from datetime import datetime
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+
+if 'data_exporter' not in globals():
+    from mage_ai.data_preparation.decorators import data_exporter
+
+
+def pg_engine():
+    host = get_secret_value("POSTGRES_HOST")
+    port = get_secret_value("POSTGRES_PORT") or "5432"
+    db   = get_secret_value("POSTGRES_DB")
+    user = get_secret_value("POSTGRES_USER")
+    pwd  = get_secret_value("POSTGRES_PASSWORD")
+    return create_engine(f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}")
+
+
+def ensure_bronze_tables(conn):
+    """
+    Crea schema/tablas/index si no existen.
+    Asume que schema bronze ya existe (igual dejamos CREATE SCHEMA por seguridad).
+    """
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS bronze;"))
+
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS bronze.trips_raw (
+          ingest_ts     TIMESTAMP NOT NULL,
+          source_month  TEXT      NOT NULL,
+          service_type  TEXT      NOT NULL,
+
+          vendorid              INTEGER NULL,
+          tpep_pickup_datetime  TIMESTAMP NULL,
+          tpep_dropoff_datetime TIMESTAMP NULL,
+          lpep_pickup_datetime  TIMESTAMP NULL,
+          lpep_dropoff_datetime TIMESTAMP NULL,
+
+          passenger_count       NUMERIC NULL,
+          trip_distance         NUMERIC NULL,
+
+          pulocationid          INTEGER NULL,
+          dolocationid          INTEGER NULL,
+
+          ratecodeid            NUMERIC NULL,
+          store_and_fwd_flag    TEXT NULL,
+
+          payment_type          INTEGER NULL,
+
+          fare_amount           NUMERIC NULL,
+          extra                 NUMERIC NULL,
+          mta_tax               NUMERIC NULL,
+          tip_amount            NUMERIC NULL,
+          tolls_amount          NUMERIC NULL,
+          improvement_surcharge NUMERIC NULL,
+          total_amount          NUMERIC NULL,
+          congestion_surcharge  NUMERIC NULL,
+          airport_fee           NUMERIC NULL,
+
+          ehail_fee             NUMERIC NULL,
+          trip_type             NUMERIC NULL
+        );
+    """))
+
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS idx_trips_raw_month_service
+        ON bronze.trips_raw (source_month, service_type);
+    """))
+
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS bronze.ingest_coverage (
+          year_month   TEXT NOT NULL,
+          service_type TEXT NOT NULL,
+          status       TEXT NOT NULL,
+          row_count    BIGINT NULL,
+          updated_ts   TIMESTAMP NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (year_month, service_type)
+        );
+    """))
+
+
+def align_to_target_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Alinea columnas del DF a las columnas de bronze.trips_raw:
+    - Lowercase
+    - Renombra LocationID -> pulocationid/dolocationid si viene con ese formato
+    - Mantiene solo columnas conocidas (para evitar errores por columnas extra)
+    - Crea columnas faltantes como NULL
+    """
+    df = df.copy()
+    df.columns = [c.lower() for c in df.columns]
+
+    # Mapeos comunes (por si llegan con nombres distintos)
+    rename_map = {
+        "pulocationid": "pulocationid",
+        "dolocationid": "dolocationid",
+        "pu_locationid": "pulocationid",
+        "do_locationid": "dolocationid",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    target_cols = [
+        "ingest_ts", "source_month", "service_type",
+        "vendorid",
+        "tpep_pickup_datetime", "tpep_dropoff_datetime",
+        "lpep_pickup_datetime", "lpep_dropoff_datetime",
+        "passenger_count", "trip_distance",
+        "pulocationid", "dolocationid",
+        "ratecodeid", "store_and_fwd_flag",
+        "payment_type",
+        "fare_amount", "extra", "mta_tax", "tip_amount", "tolls_amount",
+        "improvement_surcharge", "total_amount", "congestion_surcharge", "airport_fee",
+        "ehail_fee", "trip_type",
+    ]
+
+    # agrega columnas faltantes
+    for c in target_cols:
+        if c not in df.columns:
+            df[c] = None
+
+    # conserva solo las target
+    df = df[target_cols]
+    return df
+
+
+@data_exporter
+def export_data(data, *args, **kwargs):
+    # --- unwrap por si Mage envuelve ---
+    jobs = data
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, list):
+                jobs = v
+                break
+
+    if not isinstance(jobs, list) or not jobs:
+        raise ValueError(f"Se esperaba lista de jobs. Llegó: {type(data)}")
+
+    engine = pg_engine()
+    chunksize = int(kwargs.get("chunksize", 50_000))
+    total = len(jobs)
+
+    ok = 0
+    missing = 0
+    failed = 0
+
+    print("=" * 94)
+    print("[START] Data Exporter: ingest Bronze taxi (Yellow + Green) job por job")
+    print(f"[INFO] Jobs a procesar: {total}")
+    print(f"[INFO] chunksize: {chunksize}")
+    print("=" * 94)
+
+    # 0) Crear tablas si faltan
+    with engine.begin() as conn:
+        ensure_bronze_tables(conn)
+    print("[INIT] Tablas bronze aseguradas (trips_raw, ingest_coverage)")
+
+    t_all = time.time()
+
+    for i, job in enumerate(jobs, start=1):
+        ym = job.get("year_month")
+        st = job.get("service_type")
+        url = job.get("url_parquet")
+
+        print("\n" + "-" * 94)
+        print(f"[JOB {i}/{total}] {st} {ym}")
+        print(f"[JOB {i}] url={url}")
+
+        # 1) Leer parquet
+        try:
+            t0 = time.time()
+            df = pd.read_parquet(url, engine="pyarrow")
+            print(f"[JOB {i}] read_parquet OK | shape={df.shape} | time={time.time()-t0:.2f}s")
+        except Exception as e:
+            missing += 1
+            print(f"[JOB {i}] MISSING/ERROR leyendo parquet | {type(e).__name__}: {e}")
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO bronze.ingest_coverage(year_month, service_type, status, row_count, updated_ts)
+                    VALUES (:ym, :st, 'missing', NULL, NOW())
+                    ON CONFLICT (year_month, service_type)
+                    DO UPDATE SET status='missing', row_count=NULL, updated_ts=NOW()
+                """), {"ym": ym, "st": st})
+            continue
+
+        # 2) Metadata + align schema (evita errores de columnas)
+        df["ingest_ts"] = datetime.utcnow()
+        df["source_month"] = ym
+        df["service_type"] = st
+        df = align_to_target_schema(df)
+
+        # 3) Load DB (idempotente + chunks)
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("DELETE FROM bronze.trips_raw WHERE source_month = :ym AND service_type = :st"),
+                    {"ym": ym, "st": st}
+                )
+
+                df.to_sql(
+                    name="trips_raw",
+                    con=conn,
+                    schema="bronze",
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                    chunksize=chunksize,
+                )
+
+                row_count = conn.execute(
+                    text("SELECT COUNT(*) FROM bronze.trips_raw WHERE source_month=:ym AND service_type=:st"),
+                    {"ym": ym, "st": st}
+                ).scalar_one()
+
+                conn.execute(text("""
+                    INSERT INTO bronze.ingest_coverage(year_month, service_type, status, row_count, updated_ts)
+                    VALUES (:ym, :st, 'loaded', :rc, NOW())
+                    ON CONFLICT (year_month, service_type)
+                    DO UPDATE SET status='loaded', row_count=:rc, updated_ts=NOW()
+                """), {"ym": ym, "st": st, "rc": row_count})
+
+            ok += 1
+            print(f"[JOB {i}] DB OK | rows={row_count}")
+            print(f"[PROGRESS] ok={ok} | missing={missing} | failed={failed}")
+
+        except Exception as e:
+            failed += 1
+            print(f"[JOB {i}] FAILED cargando a DB | {type(e).__name__}: {e}")
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO bronze.ingest_coverage(year_month, service_type, status, row_count, updated_ts)
+                    VALUES (:ym, :st, 'failed', NULL, NOW())
+                    ON CONFLICT (year_month, service_type)
+                    DO UPDATE SET status='failed', row_count=NULL, updated_ts=NOW()
+                """), {"ym": ym, "st": st})
+
+        finally:
+            # 4) liberar memoria del mes
+            try:
+                del df
+            except Exception:
+                pass
+            gc.collect()
+
+    total_s = time.time() - t_all
+    print("\n" + "=" * 94)
+    print("[DONE] Ingest Bronze FINALIZADO")
+    print(f"[SUMMARY] ok={ok} | missing={missing} | failed={failed} | total={total}")
+    print(f"[SUMMARY] total_time={(total_s/60):.2f} min")
+    print("=" * 94)
+
+    return {"total": total, "ok": ok, "missing": missing, "failed": failed}
+

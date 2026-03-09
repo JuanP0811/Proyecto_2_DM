@@ -1,0 +1,8 @@
+command: run
+
+project_dir: /home/src/dbt_project
+profiles_dir: /root/.dbt
+target: dev
+
+select:
+  - models/silver

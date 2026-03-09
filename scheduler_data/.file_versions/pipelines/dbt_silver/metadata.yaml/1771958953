@@ -1,0 +1,44 @@
+blocks:
+- all_upstream_blocks_executed: true
+  color: null
+  configuration:
+    dbt:
+      command: run
+    file_source:
+      path: dbts/dbt_silver_transformations.yaml
+  downstream_blocks: []
+  executor_config: null
+  executor_type: local_python
+  has_callback: false
+  language: yaml
+  name: dbt_silver_transformations
+  retry_config: null
+  status: updated
+  timeout: null
+  type: dbt
+  upstream_blocks: []
+  uuid: dbt_silver_transformations
+cache_block_output_in_memory: false
+callbacks: []
+concurrency_config: {}
+conditionals: []
+created_at: '2026-02-23 16:59:44.406086+00:00'
+data_integration: null
+description: null
+executor_config: {}
+executor_count: 1
+executor_type: null
+extensions: {}
+name: dbt_silver
+notification_config: {}
+remote_variables_dir: null
+retry_config: {}
+run_pipeline_in_one_process: false
+settings:
+  triggers: null
+spark_config: {}
+tags: []
+type: python
+uuid: dbt_silver
+variables_dir: /home/src/mage_data/src
+widgets: []

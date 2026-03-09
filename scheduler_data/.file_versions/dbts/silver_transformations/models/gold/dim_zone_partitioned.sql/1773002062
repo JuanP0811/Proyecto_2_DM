@@ -1,0 +1,38 @@
+DROP TABLE IF EXISTS gold.dim_zone_partitioned CASCADE;
+
+CREATE TABLE gold.dim_zone_partitioned (
+    zone_key     INT NOT NULL,
+    borough      TEXT,
+    zone         TEXT,
+    service_zone TEXT,
+    PRIMARY KEY (zone_key)
+) PARTITION BY HASH (zone_key);
+
+CREATE TABLE gold.dim_zone_partitioned_p0
+PARTITION OF gold.dim_zone_partitioned
+FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+
+CREATE TABLE gold.dim_zone_partitioned_p1
+PARTITION OF gold.dim_zone_partitioned
+FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+
+CREATE TABLE gold.dim_zone_partitioned_p2
+PARTITION OF gold.dim_zone_partitioned
+FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+
+CREATE TABLE gold.dim_zone_partitioned_p3
+PARTITION OF gold.dim_zone_partitioned
+FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+
+INSERT INTO gold.dim_zone_partitioned (
+    zone_key,
+    borough,
+    zone,
+    service_zone
+)
+SELECT
+    zone_key,
+    borough,
+    zone,
+    service_zone
+FROM gold.dim_zone;

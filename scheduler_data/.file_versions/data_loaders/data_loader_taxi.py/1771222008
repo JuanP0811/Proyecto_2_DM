@@ -1,0 +1,72 @@
+if 'data_loader' not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+
+@data_loader
+def load_data(*args, **kwargs):
+    years = [2022, 2023, 2024, 2025]
+
+    jobs = []
+    for y in years:
+        for m in range(1, 13):
+            jobs.append({
+                "year": y,
+                "month": m,
+                "year_month": f"{y}-{m:02d}",
+                "service_type": "yellow",
+            })
+
+    print("=" * 70)
+    print("[START] Generando jobs para ingestión Yellow 2022-2025")
+    print(f"[INFO] Total jobs: {len(jobs)} (debe ser 48)")
+    print("[INFO] Ejemplo job:", jobs[0])
+    print("=" * 70)
+
+    return jobs
+
+
+@test
+def test_output(output, *args) -> None:
+    # En Mage, a veces `output` puede no ser el retorno real (puede llegar un int).
+    # Entonces buscamos la lista de jobs en output o en args.
+    def unwrap_to_jobs(x):
+        if isinstance(x, list):
+            return x
+        if isinstance(x, dict):
+            # toma el primer valor que sea lista
+            for v in x.values():
+                if isinstance(v, list):
+                    return v
+            return None
+        if isinstance(x, tuple):
+            # busca dentro
+            for item in x:
+                j = unwrap_to_jobs(item)
+                if isinstance(j, list):
+                    return j
+            return None
+        return None
+
+    jobs = unwrap_to_jobs(output)
+
+    # Si no estaba en output, intenta en args (Mage a veces pasa varias salidas)
+    if jobs is None and args:
+        for a in args:
+            jobs = unwrap_to_jobs(a)
+            if jobs is not None:
+                break
+
+    # DEBUG: para ver qué está llegando realmente al test
+    print("[DEBUG TEST] type(output) =", type(output), "| output =", output)
+    print("[DEBUG TEST] types(args)   =", [type(a) for a in args])
+
+    assert jobs is not None, "No pude encontrar la lista de jobs ni en output ni en args"
+    assert isinstance(jobs, list), f"Se esperaba lista de jobs, llegó {type(jobs)}"
+    assert len(jobs) == 48, f"Se esperaban 48 jobs, llegaron {len(jobs)}"
+    assert all(
+        ("year" in j and "month" in j and "year_month" in j and "service_type" in j)
+        for j in jobs
+    ), "Faltan llaves en uno o más jobs"
+

@@ -1,0 +1,66 @@
+with base as (
+
+  select
+    ingest_ts,
+    source_month,
+    service_type,
+    vendorid,
+
+    -- unificamos timestamps para yellow/green
+    coalesce(tpep_pickup_datetime, lpep_pickup_datetime)   as pickup_ts,
+    coalesce(tpep_dropoff_datetime, lpep_dropoff_datetime) as dropoff_ts,
+
+    passenger_count,
+    trip_distance,
+    pulocationid,
+    dolocationid,
+    ratecodeid,
+    store_and_fwd_flag,
+    payment_type,
+
+    fare_amount,
+    extra,
+    mta_tax,
+    tip_amount,
+    tolls_amount,
+    improvement_surcharge,
+    congestion_surcharge,
+    airport_fee,
+    ehail_fee,
+    total_amount,
+    trip_type
+
+  from bronze.trips_raw
+),
+
+enriched as (
+  select
+    b.*,
+
+    pu.borough       as pu_borough,
+    pu.zone          as pu_zone,
+    pu.service_zone  as pu_service_zone,
+
+    do_.borough      as do_borough,
+    do_.zone         as do_zone,
+    do_.service_zone as do_service_zone
+
+  from base b
+  left join bronze.taxi_zone_lookup pu
+    on b.pulocationid = pu.location_id
+  left join bronze.taxi_zone_lookup do_
+    on b.dolocationid = do_.location_id
+)
+
+select *
+from enriched
+where
+  pickup_ts is not null
+  and dropoff_ts is not null
+  and pickup_ts <= dropoff_ts
+  and trip_distance >= 0
+  and total_amount >= 0
+
+  -- ✅ FILTRO AÑOS VÁLIDOS (2022-2025)
+  and pickup_ts >= timestamp '2022-01-01'
+  and pickup_ts <  timestamp '2026-01-01'

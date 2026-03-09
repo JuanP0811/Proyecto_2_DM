@@ -1,0 +1,174 @@
+import os
+import time
+import gc
+from datetime import datetime
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+if 'data_exporter' not in globals():
+    from mage_ai.data_preparation.decorators import data_exporter
+
+
+def pg_engine():
+    """
+    Usa credenciales desde Mage Secrets / env vars:
+    POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+    """
+    host = os.environ["POSTGRES_HOST"]
+    port = os.environ.get("POSTGRES_PORT", "5432")
+    db = os.environ["POSTGRES_DB"]
+    user = os.environ["POSTGRES_USER"]
+    pwd = os.environ["POSTGRES_PASSWORD"]
+
+    return create_engine(f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}")
+
+
+@data_exporter
+def export_data(data, *args, **kwargs):
+    """
+    data: lista de jobs desde el data loader, cada job trae:
+      - year_month
+      - service_type ('yellow' o 'green')
+      - url_parquet
+    """
+    # --- robustez: si Mage envuelve output ---
+    jobs = data
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, list):
+                jobs = v
+                break
+
+    if not isinstance(jobs, list) or len(jobs) == 0:
+        raise ValueError(f"Se esperaba una lista de jobs en `data`. Llegó: {type(data)}")
+
+    engine = pg_engine()
+    total = len(jobs)
+
+    chunksize = int(kwargs.get("chunksize", 50_000))  # ajustable en runtime vars si quieres
+
+    ok = 0
+    missing = 0
+    failed = 0
+
+    print("=" * 90)
+    print("[START] Data Exporter: ingest Bronze taxi (Yellow + Green) job por job")
+    print(f"[INFO] Jobs a procesar: {total}")
+    print(f"[INFO] chunksize to_sql: {chunksize}")
+    print("=" * 90)
+
+    t_all = time.time()
+
+    for i, job in enumerate(jobs, start=1):
+        ym = job.get("year_month")
+        st = job.get("service_type")
+        url = job.get("url_parquet")
+
+        print("\n" + "-" * 90)
+        print(f"[JOB {i}/{total}] service={st} month={ym}")
+        print(f"[JOB {i}] url={url}")
+
+        # 1) Leer parquet (solo 1 mes en RAM)
+        t_read = time.time()
+        try:
+            df = pd.read_parquet(url, engine="pyarrow")
+            read_s = time.time() - t_read
+            print(f"[JOB {i}] read_parquet OK | shape={df.shape} | time={read_s:.2f}s")
+        except Exception as e:
+            missing += 1
+            print(f"[JOB {i}] MISSING/ERROR leyendo parquet | {type(e).__name__}: {e}")
+
+            # coverage: missing
+            with engine.begin() as conn:
+                conn.execute(
+                    text("""
+                        INSERT INTO bronze.ingest_coverage(year_month, service_type, status, row_count, updated_ts)
+                        VALUES (:ym, :st, 'missing', NULL, NOW())
+                        ON CONFLICT (year_month, service_type)
+                        DO UPDATE SET status='missing', row_count=NULL, updated_ts=NOW()
+                    """),
+                    {"ym": ym, "st": st}
+                )
+            continue
+
+        # 2) Normaliza + metadata
+        df.columns = [c.lower() for c in df.columns]
+        df["ingest_ts"] = datetime.utcnow()
+        df["source_month"] = ym
+        df["service_type"] = st
+
+        # 3) Cargar a Postgres (idempotente)
+        t_db = time.time()
+        try:
+            with engine.begin() as conn:
+                # Idempotencia: borra ese mes+servicio
+                conn.execute(
+                    text("DELETE FROM bronze.trips_raw WHERE source_month = :ym AND service_type = :st"),
+                    {"ym": ym, "st": st}
+                )
+
+                # Insert por chunks
+                df.to_sql(
+                    name="trips_raw",
+                    con=conn,
+                    schema="bronze",
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                    chunksize=chunksize
+                )
+
+                # Conteo real (auditoría)
+                row_count = conn.execute(
+                    text("SELECT COUNT(*) FROM bronze.trips_raw WHERE source_month = :ym AND service_type = :st"),
+                    {"ym": ym, "st": st}
+                ).scalar_one()
+
+                # coverage: loaded
+                conn.execute(
+                    text("""
+                        INSERT INTO bronze.ingest_coverage(year_month, service_type, status, row_count, updated_ts)
+                        VALUES (:ym, :st, 'loaded', :rc, NOW())
+                        ON CONFLICT (year_month, service_type)
+                        DO UPDATE SET status='loaded', row_count=:rc, updated_ts=NOW()
+                    """),
+                    {"ym": ym, "st": st, "rc": row_count}
+                )
+
+            ok += 1
+            db_s = time.time() - t_db
+            print(f"[JOB {i}] DB OK | rows={row_count} | time={db_s:.2f}s")
+            print(f"[PROGRESS] ok={ok} | missing={missing} | failed={failed}")
+
+        except Exception as e:
+            failed += 1
+            print(f"[JOB {i}] FAILED cargando a DB | {type(e).__name__}: {e}")
+
+            with engine.begin() as conn:
+                conn.execute(
+                    text("""
+                        INSERT INTO bronze.ingest_coverage(year_month, service_type, status, row_count, updated_ts)
+                        VALUES (:ym, :st, 'failed', NULL, NOW())
+                        ON CONFLICT (year_month, service_type)
+                        DO UPDATE SET status='failed', row_count=NULL, updated_ts=NOW()
+                    """),
+                    {"ym": ym, "st": st}
+                )
+
+        finally:
+            # 4) Liberar memoria sí o sí antes del siguiente mes
+            try:
+                del df
+            except Exception:
+                pass
+            gc.collect()
+
+    total_s = time.time() - t_all
+    print("\n" + "=" * 90)
+    print("[DONE] Ingest Bronze FINALIZADO")
+    print(f"[SUMMARY] ok={ok} | missing={missing} | failed={failed} | total={total}")
+    print(f"[SUMMARY] total_time={(total_s/60):.2f} min")
+    print("=" * 90)
+
+    return {"total": total, "ok": ok, "missing": missing, "failed": failed}

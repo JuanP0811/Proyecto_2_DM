@@ -4,9 +4,6 @@ postgres/
 # Variables de entorno con credenciales
 .env
 
-# Datos del scheduler
-scheduler_data/
-
 # Python
 __pycache__/
 *.py[cod]

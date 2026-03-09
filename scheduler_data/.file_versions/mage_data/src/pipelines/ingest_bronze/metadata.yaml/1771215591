@@ -1,0 +1,11 @@
+blocks:
+  - uuid: taxi_loader2
+    name: taxi_loader2
+    type: data_loader
+    language: python
+    status: updated
+    upstream_blocks: []
+
+name: ingest_bronze
+type: python
+uuid: ingest_bronze

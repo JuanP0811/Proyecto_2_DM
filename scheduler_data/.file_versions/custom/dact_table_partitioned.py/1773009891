@@ -1,0 +1,278 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+
+
+@custom
+def transform_custom(*args, **kwargs):
+    import psycopg2
+    from datetime import date
+    from mage_ai.data_preparation.shared.secrets import get_secret_value
+
+    host = get_secret_value('POSTGRES_HOST')
+    port = int(get_secret_value('POSTGRES_PORT'))
+    dbname = get_secret_value('POSTGRES_DB')
+    user = get_secret_value('POSTGRES_USER')
+    password = get_secret_value('POSTGRES_PASSWORD')
+
+    conn = psycopg2.connect(
+        host=host,
+        port=port,
+        dbname=dbname,
+        user=user,
+        password=password
+    )
+    conn.autocommit = False
+
+    try:
+        cur = conn.cursor()
+
+        # 1) Detectar rango real de pickup_date desde silver
+        cur.execute("""
+            SELECT
+                MIN(CAST(pickup_ts AS date)) AS min_date,
+                MAX(CAST(pickup_ts AS date)) AS max_date
+            FROM silver.trips_silver_clean
+            WHERE pickup_ts IS NOT NULL
+        """)
+        min_date, max_date = cur.fetchone()
+
+        if min_date is None or max_date is None:
+            raise Exception('No se encontró rango de pickup_ts en silver.trips_silver_clean.')
+
+        start_month = min_date.replace(day=1)
+        end_month = max_date.replace(day=1)
+
+        # 2) Borrar tabla anterior si existe
+        cur.execute("""
+            DROP TABLE IF EXISTS gold.fct_trips_partitioned CASCADE;
+        """)
+
+        # 3) Crear tabla padre particionada
+        # Nota:
+        # - No pongo PRIMARY KEY para evitar restricciones extra en tabla particionada.
+        # - Si después quieres PK, tendría que incluir pickup_date.
+        cur.execute("""
+            CREATE TABLE gold.fct_trips_partitioned (
+                trip_key TEXT NOT NULL,
+                pickup_date DATE NOT NULL,
+                pickup_date_key DATE,
+                dropoff_date_key DATE,
+                pu_zone_key INTEGER,
+                do_zone_key INTEGER,
+                service_type_key TEXT,
+                payment_type_key INTEGER,
+                vendor_key INTEGER,
+                pickup_ts TIMESTAMP,
+                dropoff_ts TIMESTAMP,
+                passenger_count NUMERIC,
+                trip_distance NUMERIC,
+                trip_duration_min NUMERIC,
+                fare_amount NUMERIC,
+                extra NUMERIC,
+                mta_tax NUMERIC,
+                tip_amount NUMERIC,
+                tolls_amount NUMERIC,
+                improvement_surcharge NUMERIC,
+                congestion_surcharge NUMERIC,
+                airport_fee NUMERIC,
+                ehail_fee NUMERIC,
+                total_amount NUMERIC,
+                tip_pct NUMERIC,
+                avg_speed_mph NUMERIC,
+                ratecodeid NUMERIC,
+                store_and_fwd_flag TEXT,
+                trip_type NUMERIC,
+                source_month TEXT
+            ) PARTITION BY RANGE (pickup_date);
+        """)
+
+        # 4) Crear particiones mensuales dinámicamente
+        partitions_created = []
+        current = start_month
+
+        while current <= end_month:
+            if current.month == 12:
+                next_month = date(current.year + 1, 1, 1)
+            else:
+                next_month = date(current.year, current.month + 1, 1)
+
+            partition_name = f"fct_trips_partitioned_{current.year}_{current.month:02d}"
+            partitions_created.append(f"gold.{partition_name}")
+
+            cur.execute(f"""
+                CREATE TABLE gold.{partition_name}
+                PARTITION OF gold.fct_trips_partitioned
+                FOR VALUES FROM (%s) TO (%s);
+            """, (current, next_month))
+
+            current = next_month
+
+        # 5) Insertar la fact usando dimensiones particionadas
+        cur.execute("""
+            INSERT INTO gold.fct_trips_partitioned (
+                trip_key,
+                pickup_date,
+                pickup_date_key,
+                dropoff_date_key,
+                pu_zone_key,
+                do_zone_key,
+                service_type_key,
+                payment_type_key,
+                vendor_key,
+                pickup_ts,
+                dropoff_ts,
+                passenger_count,
+                trip_distance,
+                trip_duration_min,
+                fare_amount,
+                extra,
+                mta_tax,
+                tip_amount,
+                tolls_amount,
+                improvement_surcharge,
+                congestion_surcharge,
+                airport_fee,
+                ehail_fee,
+                total_amount,
+                tip_pct,
+                avg_speed_mph,
+                ratecodeid,
+                store_and_fwd_flag,
+                trip_type,
+                source_month
+            )
+            WITH base AS (
+
+                SELECT
+                    md5(
+                        coalesce(cast(pickup_ts as text), '') || '|' ||
+                        coalesce(cast(dropoff_ts as text), '') || '|' ||
+                        coalesce(cast(vendorid as text), '') || '|' ||
+                        coalesce(cast(pulocationid as text), '') || '|' ||
+                        coalesce(cast(dolocationid as text), '') || '|' ||
+                        coalesce(cast(total_amount as text), '') || '|' ||
+                        coalesce(cast(trip_distance as text), '') || '|' ||
+                        coalesce(service_type, '') || '|' ||
+                        coalesce(source_month, '')
+                    ) as trip_key,
+
+                    cast(pickup_ts as date)  as pickup_date,
+                    cast(pickup_ts as date)  as pickup_date_key,
+                    cast(dropoff_ts as date) as dropoff_date_key,
+
+                    pulocationid as pu_zone_key,
+                    dolocationid as do_zone_key,
+                    service_type as service_type_key,
+                    payment_type::int as payment_type_key,
+                    vendorid::int as vendor_key,
+
+                    pickup_ts,
+                    dropoff_ts,
+
+                    passenger_count,
+                    trip_distance,
+                    extract(epoch from (dropoff_ts - pickup_ts)) / 60.0 as trip_duration_min,
+
+                    fare_amount,
+                    extra,
+                    mta_tax,
+                    tip_amount,
+                    tolls_amount,
+                    improvement_surcharge,
+                    congestion_surcharge,
+                    airport_fee,
+                    ehail_fee,
+                    total_amount,
+
+                    ratecodeid,
+                    store_and_fwd_flag,
+                    trip_type,
+                    source_month
+
+                FROM silver.trips_silver_clean
+            ),
+
+            validated AS (
+
+                SELECT
+                    b.*
+                FROM base b
+                INNER JOIN gold.dim_zone_partitioned puz
+                    ON b.pu_zone_key = puz.zone_key
+                INNER JOIN gold.dim_zone_partitioned doz
+                    ON b.do_zone_key = doz.zone_key
+                INNER JOIN gold.dim_service_type_partitioned st
+                    ON b.service_type_key = st.service_type_key
+                LEFT JOIN gold.dim_payment_type_partitioned pt
+                    ON b.payment_type_key = pt.payment_type_key
+                LEFT JOIN gold.dim_vendor dv
+                    ON b.vendor_key = dv.vendor_key
+            )
+
+            SELECT
+                trip_key,
+                pickup_date,
+                pickup_date_key,
+                dropoff_date_key,
+                pu_zone_key,
+                do_zone_key,
+                service_type_key,
+                payment_type_key,
+                vendor_key,
+                pickup_ts,
+                dropoff_ts,
+                passenger_count,
+                trip_distance,
+                trip_duration_min,
+                fare_amount,
+                extra,
+                mta_tax,
+                tip_amount,
+                tolls_amount,
+                improvement_surcharge,
+                congestion_surcharge,
+                airport_fee,
+                ehail_fee,
+                total_amount,
+
+                CASE
+                    WHEN fare_amount > 0 THEN tip_amount / fare_amount
+                    ELSE NULL
+                END AS tip_pct,
+
+                CASE
+                    WHEN extract(epoch from (dropoff_ts - pickup_ts)) > 0
+                         AND trip_distance IS NOT NULL
+                    THEN trip_distance / (extract(epoch from (dropoff_ts - pickup_ts)) / 3600.0)
+                    ELSE NULL
+                END AS avg_speed_mph,
+
+                ratecodeid,
+                store_and_fwd_flag,
+                trip_type,
+                source_month
+
+            FROM validated;
+        """)
+
+        # 6) Conteo final
+        cur.execute("SELECT COUNT(*) FROM gold.fct_trips_partitioned;")
+        row_count = cur.fetchone()[0]
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {
+            'status': 'success',
+            'table_created': 'gold.fct_trips_partitioned',
+            'rows_inserted': row_count,
+            'partitions_created': partitions_created,
+            'min_pickup_date': str(min_date),
+            'max_pickup_date': str(max_date)
+        }
+
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise e
